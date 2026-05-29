@@ -1,6 +1,6 @@
 # Hermes Desktop
 
-Native Electron shell for Hermes. It packages the desktop renderer, a bundled Hermes source payload, and installer targets for macOS and Windows.
+Native Electron shell for Hermes. It packages the desktop renderer, a bundled Hermes source payload, and installer targets for macOS and Windows. Note: this doc needs updating.
 
 ## Setup
 
