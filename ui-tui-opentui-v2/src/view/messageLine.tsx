@@ -1,34 +1,73 @@
 /**
- * MessageLine — renders one transcript row (spec v4 §2 `view/messageLine.tsx`).
- * Phase 2 slice: flat text messages with a role gutter + streaming `▍` cursor,
- * fully themed. The ordered-parts dispatch (text/tool/reasoning §7) replaces the
- * flat `text` field in the next slice — this file grows into that `<Switch>` loop.
+ * MessageLine — renders one transcript row (spec v4 §2 / §7). An assistant turn
+ * is ONE ordered `parts[]` dispatched by `<Switch>`/`<Match>` on `part.type`, so
+ * text / reasoning / tool interleave INLINE (the §7 fix for "tools dump below").
+ * User/system rows (and settled/resumed assistant rows with no parts) render flat
+ * `text`. Fully themed; rich text via <b>/<span>, never an attributes bitmask (§8 #1).
  *
- * Rich text via <b>/<span> children, never an attributes bitmask (gotcha §8 #1);
- * inline color is `<span style={{ fg }}>`.
+ * Stable `id` per part as the <For> key so a new tool part below a streaming text
+ * part doesn't remount it. Native <markdown> for text parts lands in 2b-ii.
  */
-import { Show } from 'solid-js'
+import { For, Match, Show, Switch } from 'solid-js'
 
 import type { Message } from '../logic/store.ts'
 import { useTheme } from './theme.tsx'
+import { ToolPart } from './toolPart.tsx'
+
+const GUTTER = 2
 
 export function MessageLine(props: { message: Message }) {
   const theme = useTheme()
-  const gutter = () =>
-    props.message.role === 'assistant'
-      ? `${theme().brand.icon} `
-      : props.message.role === 'user'
-        ? `${theme().brand.prompt} `
-        : ''
-  const gutterFg = () => (props.message.role === 'assistant' ? theme().color.accent : theme().color.prompt)
+  const m = () => props.message
+  const glyph = () => (m().role === 'assistant' ? theme().brand.icon : m().role === 'user' ? theme().brand.prompt : '·')
+  const glyphFg = () =>
+    m().role === 'assistant' ? theme().color.accent : m().role === 'user' ? theme().color.prompt : theme().color.muted
+  const hasParts = () => (m().parts?.length ?? 0) > 0
 
   return (
-    <text style={{ flexShrink: 0 }}>
-      <span style={{ fg: gutterFg() }}>{gutter()}</span>
-      <span style={{ fg: theme().color.text }}>{props.message.text}</span>
-      <Show when={props.message.streaming}>
-        <span style={{ fg: theme().color.muted }}>▍</span>
-      </Show>
-    </text>
+    <box style={{ flexDirection: 'row', flexShrink: 0, marginTop: m().role === 'user' ? 1 : 0 }}>
+      <box style={{ flexShrink: 0, width: GUTTER }}>
+        <text>
+          <span style={{ fg: glyphFg() }}>{glyph()}</span>
+        </text>
+      </box>
+      <box style={{ flexDirection: 'column', flexGrow: 1, minWidth: 0 }}>
+        <Show
+          when={m().role === 'assistant' && hasParts()}
+          fallback={
+            <text>
+              <span style={{ fg: theme().color.text }}>{m().text}</span>
+            </text>
+          }
+        >
+          <For each={m().parts ?? []}>
+            {part => (
+              <Switch>
+                <Match when={part.type === 'tool' && part}>{tool => <ToolPart part={tool()} />}</Match>
+                <Match when={part.type === 'reasoning' && part}>
+                  {r => (
+                    <text>
+                      <span style={{ fg: theme().color.muted }}>{r().text}</span>
+                    </text>
+                  )}
+                </Match>
+                <Match when={part.type === 'text' && part}>
+                  {t => (
+                    <text>
+                      <span style={{ fg: theme().color.text }}>{t().text}</span>
+                    </text>
+                  )}
+                </Match>
+              </Switch>
+            )}
+          </For>
+        </Show>
+        <Show when={m().streaming && !hasParts()}>
+          <text>
+            <span style={{ fg: theme().color.muted }}>▍</span>
+          </text>
+        </Show>
+      </box>
+    </box>
   )
 }

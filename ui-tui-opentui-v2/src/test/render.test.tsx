@@ -55,4 +55,31 @@ describe('App render (Phase 1, themed)', () => {
     expect(frame).toContain('Zephyr')
     expect(frame).not.toContain('Hermes Agent')
   })
+
+  test('renders an inline tool part between text (ordered parts §7)', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.apply({ type: 'message.start' })
+    store.apply({ type: 'message.delta', payload: { text: 'Listing files:' } })
+    store.apply({ type: 'tool.start', payload: { tool_id: 't1', name: 'terminal' } })
+    store.apply({
+      type: 'tool.complete',
+      payload: { tool_id: 't1', result_text: '{"output":"alpha.txt\\nbeta.txt","exit_code":0}' }
+    })
+    store.apply({ type: 'message.complete' })
+
+    const frame = await captureFrame(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <App store={store} />
+        </ThemeProvider>
+      ),
+      { width: 60, height: 16 }
+    )
+
+    expect(frame).toContain('Listing files:') // text part
+    expect(frame).toContain('terminal') // tool name (inline, between text blocks)
+    expect(frame).toContain('alpha.txt') // envelope-stripped output, block-rendered
+    expect(frame).not.toContain('exit_code') // the {output,exit_code} envelope is stripped
+  })
 })
