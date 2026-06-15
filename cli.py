@@ -4150,8 +4150,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
             enabled = bool(pet_cfg.get("enabled"))
             slug = str(pet_cfg.get("slug", "") or "")
-            cols = int(pet_cfg.get("unicode_cols", 18) or 18)
             scale = float(pet_cfg.get("scale", constants.DEFAULT_SCALE) or constants.DEFAULT_SCALE)
+            cols = constants.resolve_cols(scale, pet_cfg.get("unicode_cols", 0))
 
             if not enabled:
                 with self._pet_lock:

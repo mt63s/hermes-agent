@@ -1531,10 +1531,16 @@ DEFAULT_CONFIG = {
             #   auto  — detect kitty/iTerm2/sixel, else unicode half-blocks
             #   kitty | iterm | sixel | unicode | off
             "render_mode": "auto",
-            # On-screen scale relative to native 192×208 frames (petdex uses 0.7).
-            "scale": 0.7,
-            # Width in terminal columns for the unicode half-block fallback.
-            "unicode_cols": 18,
+            # Master size scalar (relative to native 192×208 frames). One knob
+            # shrinks every surface: the desktop canvas scales its pixels by it
+            # and the CLI/TUI derive their terminal column width from it. The
+            # half-block fallback clamps to a legibility floor (it can't shrink
+            # as far as true-pixel kitty/GUI without turning to mush).
+            "scale": 0.33,
+            # Hard override for terminal column width. 0 = auto (derive from
+            # scale); set a positive int only to pin the half-block/kitty width
+            # independently of scale.
+            "unicode_cols": 0,
         },
     },
 

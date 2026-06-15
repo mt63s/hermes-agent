@@ -24,9 +24,43 @@ FRAMES_PER_STATE = 6
 # Full-loop duration for one state, milliseconds (petdex default).
 LOOP_MS = 1100
 
-# Default on-screen scale relative to native frame size (petdex desktop uses
-# 0.7).  Surfaces may override via ``display.pet.scale``.
-DEFAULT_SCALE = 0.7
+# Default on-screen scale relative to native frame size.  ``display.pet.scale``
+# is the single master scalar: the desktop canvas multiplies its native pixels
+# by it and every terminal surface derives its half-block/kitty column width
+# from it (see :func:`cols_for_scale`), so one number shrinks all three
+# interfaces together.  (petdex's own clients render at 0.7; we default smaller
+# so the kitty/GUI mascot stays a glanceable corner sprite.  The half-block
+# fallback can't shrink as far — see ``UNICODE_MIN_COLS`` — and clamps to its
+# legibility floor instead.)
+DEFAULT_SCALE = 0.33
+
+# Terminal cells one native frame spans at ``scale == 1.0``.  A cell is ~8px
+# wide, a frame is ``FRAME_W`` (192) px → 24 cells.  This mirrors the kitty
+# graphics placement (``scaled_px // 8``) so at full scale every renderer agrees.
+BASE_UNICODE_COLS = FRAME_W // 8
+
+# Legibility floor for the half-block fallback.  A half-block cell samples the
+# sprite at only 1 horizontal + 2 vertical taps, so below this width a 192×208
+# pet collapses into an unreadable blob *regardless* of scale.  kitty/GUI draw
+# true pixels and have no such floor — that's why the same ``scale: 0.33`` is
+# crisp there but mush in half-blocks.  ``scale`` shrinks the unicode pet down
+# TO this floor (and grows it above), instead of past it into noise.
+UNICODE_MIN_COLS = 16
+
+
+def cols_for_scale(scale: float) -> int:
+    """Half-block width implied by *scale*, clamped to the legibility floor.
+
+    Above the floor it tracks the kitty cell box (``scaled_px // 8``) so the two
+    renderers converge at larger sizes; below it the floor keeps the sprite
+    readable rather than letting it devolve into a blob.
+    """
+    return max(UNICODE_MIN_COLS, round(BASE_UNICODE_COLS * (scale or DEFAULT_SCALE)))
+
+
+def resolve_cols(scale: float, unicode_cols: int = 0) -> int:
+    """Resolve terminal width: explicit *unicode_cols* override, else from *scale*."""
+    return int(unicode_cols) if unicode_cols and int(unicode_cols) > 0 else cols_for_scale(scale)
 
 
 class PetState(str, Enum):

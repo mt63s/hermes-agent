@@ -489,27 +489,29 @@ class PetRenderer:
         frame = frames[index % len(frames)]
         return _downscale_cells(frame, target_cols=cols or self.unicode_cols)
 
-    def kitty_cell_rows(self, cols: int) -> int:
-        """Cell height that mirrors the half-block footprint for *cols* wide.
+    def _cell_box(self, frame) -> tuple[int, int]:
+        """Terminal cell box for a scaled frame (~8×16 px per cell).
 
-        Keeps the kitty image and the unicode fallback occupying the same area
-        so swapping renderers doesn't shift the layout.
+        Must match :meth:`frame` graphics sizing — kitty stretches the image to
+        fill ``c``×``r`` cells, so these must reflect the scaled pixel
+        dimensions, not a native-aspect column count (that upscales small pets).
         """
-        aspect = self.frame_h / max(1, self.frame_w)
-        return max(1, round(cols * aspect * 0.5))
+        return max(1, frame.width // 8), max(1, frame.height // 16)
 
-    def kitty_payload(self, state: PetState | str, *, cols: int, image_id: int) -> dict | None:
+    def kitty_payload(self, state: PetState | str, *, image_id: int) -> dict | None:
         """Build the kitty Unicode-placeholder payload for one state.
 
         Returns ``{cols, rows, placeholder, frames}`` where ``frames`` is a
         list of transmit escapes (one per animation frame, all reusing
         ``image_id``) and ``placeholder`` is the static text grid Ink paints.
-        ``None`` when no frame is available.
+        Placement geometry is derived from the scaled frame pixels (via
+        :meth:`_cell_box`), not ``unicode_cols`` — kitty upscales to fill
+        ``c``×``r`` cells. ``None`` when no frame is available.
         """
         frames = self._frames(state)
         if not frames:
             return None
-        rows = self.kitty_cell_rows(cols)
+        cols, rows = self._cell_box(frames[0])
         return {
             "cols": cols,
             "rows": rows,
@@ -531,11 +533,7 @@ class PetRenderer:
         if not frames:
             return ""
         frame = frames[index % len(frames)]
-
-        # Display box in cells for graphics protocols (≈ scaled px / cell size,
-        # assuming a ~8×16 cell; terminals re-fit anyway).
-        cell_cols = max(1, frame.width // 8)
-        cell_rows = max(1, frame.height // 16)
+        cell_cols, cell_rows = self._cell_box(frame)
 
         try:
             if self.mode == "kitty":

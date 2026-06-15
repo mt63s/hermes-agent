@@ -6,6 +6,9 @@ const DEFAULT_FRAME_W = 192
 const DEFAULT_FRAME_H = 208
 const DEFAULT_FRAMES = 6
 const DEFAULT_LOOP_MS = 1100
+// Mirrors agent.pet.constants.DEFAULT_SCALE — fallback only; the gateway sends
+// the configured scale.
+const DEFAULT_SCALE = 0.33
 const DEFAULT_STATE_ROWS = ['idle', 'wave', 'run', 'failed', 'review', 'jump', 'extra1', 'extra2']
 
 interface PetSpriteProps {
@@ -33,7 +36,7 @@ function PetSpriteImpl({ info, zoom = 1 }: PetSpriteProps) {
   const frameH = info.frameH ?? DEFAULT_FRAME_H
   const frames = info.framesPerState ?? DEFAULT_FRAMES
   const loopMs = info.loopMs ?? DEFAULT_LOOP_MS
-  const scale = (info.scale ?? 0.7) * zoom
+  const scale = (info.scale ?? DEFAULT_SCALE) * zoom
   const rows = info.stateRows ?? DEFAULT_STATE_ROWS
 
   const drawW = Math.round(frameW * scale)

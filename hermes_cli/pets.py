@@ -137,7 +137,7 @@ def _cmd_show(args) -> int:
     import time
 
     from agent.pet import store
-    from agent.pet.constants import LOOP_MS, STATE_ROWS, PetState
+    from agent.pet.constants import DEFAULT_SCALE, LOOP_MS, STATE_ROWS, PetState, resolve_cols
     from agent.pet.render import build_renderer
 
     cfg = _pet_config()
@@ -148,8 +148,8 @@ def _cmd_show(args) -> int:
         return 1
 
     mode_cfg = getattr(args, "mode", None) or str(cfg.get("render_mode", "auto") or "auto")
-    scale = float(getattr(args, "scale", 0) or cfg.get("scale", 0.7) or 0.7)
-    cols = int(cfg.get("unicode_cols", 18) or 18)
+    scale = float(getattr(args, "scale", 0) or cfg.get("scale", DEFAULT_SCALE) or DEFAULT_SCALE)
+    cols = resolve_cols(scale, cfg.get("unicode_cols", 0))
 
     renderer = build_renderer(
         pet.spritesheet,

@@ -4902,8 +4902,8 @@ def _(rid, params: dict) -> dict:
             return _ok(rid, {"enabled": False})
 
         state = str(params.get("state") or constants.PetState.IDLE.value)
-        cols = int(params.get("cols") or pet_cfg.get("unicode_cols", 18) or 18)
         scale = float(pet_cfg.get("scale", constants.DEFAULT_SCALE) or constants.DEFAULT_SCALE)
+        cols = int(params.get("cols") or 0) or constants.resolve_cols(scale, pet_cfg.get("unicode_cols", 0))
 
         # Graphics path: when the TUI is attached to a real TTY (``graphics``)
         # and the terminal speaks the kitty protocol, return a Unicode-
@@ -4917,9 +4917,10 @@ def _(rid, params: dict) -> dict:
             gmode = render.detect_terminal_graphics() if configured in ("", "auto") else configured
             if gmode == "kitty":
                 image_id = render.kitty_image_id(pet.slug)
+                # kitty sizes from scaled pixels (_cell_box), so unicode_cols is moot here.
                 payload = PetRenderer(
-                    str(pet.spritesheet), mode="kitty", scale=scale, unicode_cols=cols
-                ).kitty_payload(state, cols=cols, image_id=image_id)
+                    str(pet.spritesheet), mode="kitty", scale=scale
+                ).kitty_payload(state, image_id=image_id)
                 if payload:
                     kcount = len(payload["frames"]) or 1
                     return _ok(

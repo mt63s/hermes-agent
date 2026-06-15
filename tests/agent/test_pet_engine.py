@@ -48,6 +48,26 @@ def test_state_row_index_maps_to_taxonomy():
     assert constants.state_row_index("nonsense") == 0
 
 
+def test_cols_for_scale_is_monotonic_and_floored():
+    # scale is the master size knob: smaller scale never yields more columns,
+    # and half-blocks clamp to a legibility floor rather than devolving to mush.
+    sizes = [constants.cols_for_scale(s) for s in (0.1, 0.3, 0.5, 0.7, 1.0, 1.5)]
+    assert sizes == sorted(sizes)
+    assert all(c >= constants.UNICODE_MIN_COLS for c in sizes)
+    # tiny scales pin to the floor; large scales grow past it.
+    assert constants.cols_for_scale(0.05) == constants.UNICODE_MIN_COLS
+    assert constants.cols_for_scale(0.33) == constants.UNICODE_MIN_COLS
+    assert constants.cols_for_scale(2.0) > constants.UNICODE_MIN_COLS
+
+
+def test_resolve_cols_override_else_scale():
+    # 0 / falsy → derive from scale; a positive int hard-overrides scale.
+    assert constants.resolve_cols(0.7, 0) == constants.cols_for_scale(0.7)
+    assert constants.resolve_cols(0.7, None) == constants.cols_for_scale(0.7)
+    assert constants.resolve_cols(2.0, 12) == 12
+    assert constants.resolve_cols(0.1, -5) == constants.cols_for_scale(0.1)
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # synthetic spritesheet fixture
 # ─────────────────────────────────────────────────────────────────────────
@@ -185,11 +205,16 @@ def test_kitty_placeholder_rows_grid_contract():
 def test_kitty_payload_structure(boba_like):
     sprite = store.load_pet("boba").spritesheet
     image_id = render.kitty_image_id("boba")
-    r = render.PetRenderer(str(sprite), mode="kitty", scale=0.4, unicode_cols=18)
-    payload = r.kitty_payload("run", cols=18, image_id=image_id)
+    scale = 0.4
+    r = render.PetRenderer(str(sprite), mode="kitty", scale=scale, unicode_cols=18)
+    payload = r.kitty_payload("run", image_id=image_id)
     assert payload is not None
-    assert payload["cols"] == 18
-    assert payload["rows"] == r.kitty_cell_rows(18) >= 1
+    # placement box must follow scaled pixels, not unicode_cols (kitty upscales to c×r).
+    frames = r._frames("run")
+    expect_cols, expect_rows = r._cell_box(frames[0])
+    assert payload["cols"] == expect_cols
+    assert payload["rows"] == expect_rows
+    assert expect_cols < 18  # 0.4 scale is much smaller than a pinned 18-col box
     # placeholder grid matches the requested geometry
     assert len(payload["placeholder"]) == payload["rows"]
     # one transmit escape per animation frame, each a kitty virtual placement
@@ -204,7 +229,7 @@ def test_kitty_payload_structure(boba_like):
 
 def test_kitty_payload_none_when_no_frames(tmp_path):
     r = render.PetRenderer(str(tmp_path / "missing.webp"), mode="kitty")
-    assert r.kitty_payload("idle", cols=18, image_id=1) is None
+    assert r.kitty_payload("idle", image_id=1) is None
 
 
 def test_off_mode_and_missing_sheet_degrade(tmp_path):
