@@ -381,11 +381,6 @@ jobs:
         run: |
           Get-Content "$env:HERMES_HOME\logs\bootstrap-installer.log"
 
-      - name: Bootstrap log
-        shell: pwsh
-        run: |
-          Get-Content "$env:HERMES_HOME\logs\bootstrap.log"
-
       - name: Autohotkey log
         shell: pwsh
         run: |

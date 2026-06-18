@@ -391,6 +391,11 @@ function Install-Uv {
         $uvInstallExit = $LASTEXITCODE
         $ErrorActionPreference = $prevEAP
 
+        if ($uvInstallExit -ne 0) {
+            Write-Warn "uv installer exited $uvInstallExit; output:"
+            Write-Host ($uvInstallLog | Out-String) -ForegroundColor DarkGray
+        }
+
         if (Test-Path $managedUv) {
             $script:UvCmd = $managedUv
             $version = & $managedUv --version
@@ -398,8 +403,15 @@ function Install-Uv {
             return $true
         }
 
-        Write-Warn "uv installer exited $uvInstallExit; output:"
-        Write-Host ($uvInstallLog | Out-String) -ForegroundColor DarkGray
+        $binDir = Join-Path $HermesHome "bin"
+        Write-Warn "uv not found at $managedUv; listing $binDir:"
+        if (Test-Path $binDir) {
+            Get-ChildItem -Path $binDir -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+                Write-Host "  $($_.FullName)" -ForegroundColor DarkGray
+            }
+        } else {
+            Write-Host "  <directory does not exist>" -ForegroundColor DarkGray
+        }
 
         Write-Err "uv installed but not found at $managedUv"
         Write-Info "Install manually: https://docs.astral.sh/uv/getting-started/installation/"
