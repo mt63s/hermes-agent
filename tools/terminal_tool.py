@@ -2144,20 +2144,27 @@ def terminal_tool(
                 "EOF."
             )
 
+        # Claim the (shared "default") terminal env for the session driving this
+        # command. File tools read env.cwd_owner to decide whether the env's live
+        # cwd is THIS session's `cd` or a different worktree session's — without
+        # it, two open worktree sessions sharing the env route each other's edits
+        # to the wrong checkout. get_current_session_key()'s contextvar doesn't
+        # cross tool-worker threads, so fall back to the raw task_id (which IS the
+        # session_key for the top-level agent) — a stable, thread-safe anchor.
+        from tools.approval import get_current_session_key
+
+        session_key = get_current_session_key(default="") or (task_id or "")
+        try:
+            env.cwd_owner = session_key
+        except Exception:
+            pass
+
         if background:
             # Spawn a tracked background process via the process registry.
             # For local backends: uses subprocess.Popen with output buffering.
             # For non-local backends: runs inside the sandbox via env.execute().
-            from tools.approval import get_current_session_key
             from tools.process_registry import process_registry
 
-            # get_current_session_key() reads a contextvar that does NOT
-            # propagate to concurrent tool-worker threads, so a backgrounded
-            # command spawned off the main turn thread would record an empty
-            # session_key — and then `process.kill` / stop can't find it to kill
-            # it (rogue process). The raw `task_id` IS the session_key for the
-            # top-level agent, so fall back to it: a stable, thread-safe anchor.
-            session_key = get_current_session_key(default="") or (task_id or "")
             effective_cwd = _resolve_command_cwd(
                 workdir=workdir,
                 env=env,
