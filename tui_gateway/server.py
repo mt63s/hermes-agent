@@ -2191,7 +2191,11 @@ def _load_enabled_toolsets() -> list[str] | None:
 
             selection = coding_selection(platform="tui")
             if selection is not None:
-                return selection
+                # Fold in `project` here too: this is a GUI-only resolver, and
+                # the focus-mode coding posture returns before the fallback path
+                # that normally adds it — without this the desktop loses the
+                # project tools exactly when sitting in a repo (see below).
+                return sorted({*selection, "project"})
         except Exception:
             pass
 

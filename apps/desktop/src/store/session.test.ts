@@ -82,7 +82,9 @@ describe('mergeSessionPage', () => {
     const previous = [session({ id: 'a' }), session({ id: 'b' })]
     const incoming = [session({ id: 'a' })]
 
-    expect(mergeSessionPage(previous, incoming, [])).toBe(incoming)
+    // Content, not identity: the title-carry map rebuilds the array even when
+    // nothing is carried, and `incoming` is a fresh server page every fetch.
+    expect(mergeSessionPage(previous, incoming, [])).toEqual(incoming)
   })
 
   it('keeps a still-working session the server omitted', () => {

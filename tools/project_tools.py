@@ -107,6 +107,9 @@ def project_create(name: str, path: Optional[str] = None, task_id: Optional[str]
     except ValueError as exc:
         return json.dumps({"success": False, "error": str(exc)})
 
+    if proj is None:
+        return json.dumps({"success": False, "error": "project vanished after create"})
+
     primary = _primary_path(proj)
     _apply_workspace(task_id, primary, proj.name)
 

@@ -208,6 +208,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"project: {exc}", file=sys.stderr)
         return 2
+    if proj is None:
+        print("project: vanished after create", file=sys.stderr)
+        return 2
     print(f"Created project {proj.slug} ({pid})")
     _print_project(proj)
     return 0

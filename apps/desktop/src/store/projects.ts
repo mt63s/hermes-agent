@@ -423,9 +423,10 @@ export async function createProject(input: CreateProjectInput): Promise<ProjectI
     use: input.use ?? false
   })
 
-  // Optimistic: drop the new project into the cached list + tree the moment the
-  // create resolves, so the row (and an entered scope) shows without waiting on
-  // the background refreshes that reconcile counts/repos.
+  // Not optimistic (the create awaits the RPC first, so there's nothing to roll
+  // back): apply the server's row into the cached list + tree at once, so it
+  // (and an entered scope) shows without waiting on the background refreshes
+  // that reconcile counts/repos.
   const created = res.project
 
   if (created) {

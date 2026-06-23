@@ -703,6 +703,19 @@ def test_load_enabled_toolsets_accepts_plugin_env_after_discovery(monkeypatch):
     assert server._load_enabled_toolsets() == ["plugin_demo"]
 
 
+def test_load_enabled_toolsets_folds_project_into_focus_posture(monkeypatch):
+    # Focus-mode coding posture returns before the config fallback, but it's
+    # still a GUI-only resolver — `project` must come along so the desktop keeps
+    # the project tools while sitting in a repo.
+    monkeypatch.delenv("HERMES_TUI_TOOLSETS", raising=False)
+
+    import agent.coding_context as cc
+
+    monkeypatch.setattr(cc, "coding_selection", lambda **_: ["coding", "figma"])
+
+    assert server._load_enabled_toolsets() == ["coding", "figma", "project"]
+
+
 def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
     monkeypatch.setenv("HERMES_TUI_TOOLSETS", "mcp-off")
     monkeypatch.setitem(
