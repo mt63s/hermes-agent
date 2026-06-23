@@ -17,6 +17,10 @@ export interface SidebarSessionGroup {
   color?: null | string
   // True when this group is a repo's main checkout (vs a linked worktree).
   isMain?: boolean
+  // True for the repo's primary ("home") checkout lane — the single lane that
+  // collapses all main-checkout sessions, labeled by the worktree's LIVE branch
+  // (defaulting to `main`). Renders a home glyph and pins to the top.
+  isHome?: boolean
   // True for the synthetic lane that collapses all of a repo's kanban task
   // worktrees (`<repo>/.worktrees/t_*`) into one row, so a heavy board doesn't
   // spray hundreds of throwaway branch lanes across the sidebar.
@@ -101,18 +105,21 @@ const isTrunkLane = (group: SidebarSessionGroup): boolean =>
 const laneActivity = (group: SidebarSessionGroup): number =>
   group.sessions.reduce((max, session) => Math.max(max, sessionRecency(session)), 0)
 
+// Lane tiers (low sorts first): the repo's primary ("home") checkout pins above
+// everything (it's "where you are", labeled by its live branch), then trunk,
+// then ordinary branches/worktrees, then the kanban aggregate.
+const laneRank = (group: SidebarSessionGroup): number =>
+  group.isHome ? 0 : isTrunkLane(group) ? 1 : group.isKanban ? 3 : 2
+
 /**
- * Trunk (main/master/...) sticks to the top; the kanban aggregate sinks to the
- * bottom; everything between — branches and linked worktrees alike — sorts by
+ * Sort by tier (home → trunk → branches/worktrees → kanban); within a tier, by
  * most-recent activity (empty lanes fall last), label as the tiebreak.
  */
 function compareWorktreeGroups(a: SidebarSessionGroup, b: SidebarSessionGroup): number {
-  if (isTrunkLane(a) !== isTrunkLane(b)) {
-    return isTrunkLane(a) ? -1 : 1
-  }
+  const byRank = laneRank(a) - laneRank(b)
 
-  if (Boolean(a.isKanban) !== Boolean(b.isKanban)) {
-    return a.isKanban ? 1 : -1
+  if (byRank !== 0) {
+    return byRank
   }
 
   const byActivity = laneActivity(b) - laneActivity(a)
@@ -157,18 +164,22 @@ export function mergeRepoWorktreeGroups(
     }
   }
 
-  // Reconcile each linked lane against git truth so its label AND path describe
-  // the SAME worktree. Two repair directions:
+  // The primary ("home") checkout's LIVE branch. A repo dir is only ever on ONE
+  // branch, so every main-checkout session lane (historical branches over the
+  // same root path) collapses into a single home lane labeled by this live
+  // branch, defaulting to `main`. Known only when the local git probe ran;
+  // remote backends keep the backend's recorded-branch main lane untouched.
+  const mainWorktree = (discoveredWorktrees ?? []).find(w => w.isMain)
+  const homeBranch = mainWorktree && !mainWorktree.detached ? mainWorktree.branch?.trim() || DEFAULT_BRANCH_LABEL : ''
+
+  // Reconcile a LINKED worktree lane against git truth so its label AND path
+  // describe the SAME worktree. Two repair directions:
   //  1. Path git knows → relabel to that path's live branch (git UIs identify a
   //     worktree by its checked-out branch, not the dir it lives in).
   //  2. Path git DOESN'T know but the label IS a live branch → the lane's path
-  //     has gone stale (an old/recreated worktree dir). Re-anchor it to that
-  //     branch's real path. Without this, a lane reads `bb/attempts` while
-  //     "reveal in Finder" opens a different, stale checkout — the reported
-  //     "randomly wrong label / reveal opens a different worktree" bug.
-  // The main checkout is never reconciled: the repo root can keep historical
-  // `main` lanes while the physical checkout sits on another branch; the live
-  // root checkout is injected below as its own lane when needed.
+  //     has gone stale; re-anchor it to that branch's real path, else "reveal"
+  //     opens a different, stale checkout. The home checkout is folded
+  //     separately (below), never here.
   const reconcile = (group: SidebarSessionGroup): SidebarSessionGroup => {
     if (group.isMain || group.isKanban) {
       return group
@@ -189,10 +200,47 @@ export function mergeRepoWorktreeGroups(
     return group
   }
 
-  // Reconcile, then collapse any duplicate that the re-anchor produced (a stale
-  // lane re-pointed onto a path a real lane already holds) — keep the richer
-  // (more sessions) lane so no rows are lost.
-  const reconciled = repo.groups.map(reconcile)
+  const dedupeById = (sessions: SessionInfo[]): SessionInfo[] => {
+    const byId = new Map<string, SessionInfo>()
+
+    for (const session of sessions) {
+      byId.set(session.id, byId.get(session.id) ?? session)
+    }
+
+    return [...byId.values()]
+  }
+
+  // Fold every main-checkout lane into one home lane (when the live branch is
+  // known); reconcile the linked worktrees. Without a probe, main lanes pass
+  // through untouched (remote backend).
+  let homeLane: SidebarSessionGroup | null = null
+  const reconciled: SidebarSessionGroup[] = []
+
+  for (const group of repo.groups) {
+    if (homeBranch && group.isMain) {
+      if (homeLane) {
+        homeLane.sessions = dedupeById([...homeLane.sessions, ...group.sessions])
+      } else {
+        homeLane = { ...group, id: branchLaneId(repo.id, homeBranch), label: homeBranch, path: repo.path, isMain: true, isHome: true, sessions: [...group.sessions] }
+      }
+
+      continue
+    }
+
+    reconciled.push(reconcile(group))
+  }
+
+  // The home checkout always shows, even with no sessions on the current branch yet.
+  if (homeBranch && !homeLane) {
+    homeLane = { id: branchLaneId(repo.id, homeBranch), label: homeBranch, path: repo.path, isMain: true, isHome: true, sessions: [] }
+  }
+
+  if (homeLane) {
+    reconciled.push(homeLane)
+  }
+
+  // Collapse any duplicate a re-anchor produced (a stale lane re-pointed onto a
+  // path a real lane already holds) — keep the richer (more sessions) lane.
   const byPath = new Map<string, SidebarSessionGroup>()
   const merged: SidebarSessionGroup[] = []
 
@@ -219,14 +267,18 @@ export function mergeRepoWorktreeGroups(
   const seenIds = new Set(merged.map(group => group.id))
   const seenPaths = new Set(merged.map(group => group.path).filter((path): path is string => Boolean(path)))
   // Dedupe by branch label too: a branch shows once even if it's checked out in
-  // a linked worktree AND already has a session lane (e.g. a worktree sitting on
-  // `main` must not spawn a second, empty "main" next to the trunk lane).
+  // a linked worktree AND already has a session lane.
   const seenLabels = new Set(merged.map(group => group.label.toLowerCase()))
 
   for (const worktree of discoveredWorktrees ?? []) {
     const wtPath = worktree.path?.trim()
 
     if (!wtPath) {
+      continue
+    }
+
+    // The home checkout is already the collapsed home lane (above).
+    if (worktree.isMain && homeBranch) {
       continue
     }
 

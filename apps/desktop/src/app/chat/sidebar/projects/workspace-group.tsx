@@ -43,11 +43,16 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
   const hiddenCount = Math.max(0, totalCount - visibleSessions.length)
   const nextCount = Math.min(SIDEBAR_GROUP_PAGE, hiddenCount)
 
-  // Leading glyph: profile color dot, or a branch/kanban mark for a worktree.
+  // Leading glyph: profile color dot, a home mark for the repo's primary
+  // checkout (labeled by its live branch), or a branch/kanban mark otherwise.
   const leadingIcon = group.color ? (
     <span aria-hidden="true" className="size-2 shrink-0 rounded-full" style={{ backgroundColor: group.color }} />
   ) : (
-    <Codicon className="shrink-0 text-(--ui-text-tertiary)" name={group.isKanban ? 'checklist' : 'git-branch'} size="0.75rem" />
+    <Codicon
+      className="shrink-0 text-(--ui-text-tertiary)"
+      name={group.isKanban ? 'checklist' : group.isHome ? 'home' : 'git-branch'}
+      size="0.75rem"
+    />
   )
 
   // Reveal already-loaded rows first; only hit the backend when the next page

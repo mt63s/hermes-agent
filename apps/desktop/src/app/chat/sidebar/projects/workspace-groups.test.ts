@@ -87,6 +87,15 @@ describe('sortWorktreeGroups', () => {
     expect(sortWorktreeGroups(groups).map(g => g.label)).toEqual(['main', 'busy-worktree', 'stale-branch', 'kanban'])
   })
 
+  it('pins the live home checkout above trunk, even when it has no sessions yet', () => {
+    const groups = [
+      lane({ id: 'main', label: 'main', isMain: true, sessions: [makeSession('/x', { last_active: 999 })] }),
+      lane({ id: 'home', label: 'bb/projects-paradigm', isMain: true, isHome: true })
+    ]
+
+    expect(sortWorktreeGroups(groups).map(g => g.label)).toEqual(['bb/projects-paradigm', 'main'])
+  })
+
   it('falls back to label order for equally-idle lanes', () => {
     const groups = [
       lane({ id: 'b', label: 'beta', isMain: false }),
@@ -283,7 +292,7 @@ describe('mergeRepoWorktreeGroups (visual enhancer)', () => {
     expect(mergeRepoWorktreeGroups(repo, discovered).find(g => g.id === '/repo-ci')?.label).toBe('repo-ci')
   })
 
-  it('keeps the default-branch lane and also surfaces the live main-checkout branch', () => {
+  it('collapses the main checkout into one home lane labeled by the live branch (off-trunk)', () => {
     const repo = {
       id: '/repo',
       path: '/repo',
@@ -292,22 +301,66 @@ describe('mergeRepoWorktreeGroups (visual enhancer)', () => {
       ]
     }
 
-    // The repo root is a worktree too. If it is currently switched away from
-    // main, keep the existing main sessions and inject the live branch as its
-    // own lane even though both lanes share the same physical path.
+    // The repo root is switched to a feature branch. The historical "main"
+    // sessions fold into ONE home lane labeled by the live branch — no stale
+    // "main" lane lingering beside it.
     const discovered: HermesGitWorktree[] = [
       { branch: 'some-feature', detached: false, isMain: true, locked: false, path: '/repo' }
     ]
 
     const merged = mergeRepoWorktreeGroups(repo, discovered)
-    const main = merged.find(g => g.label === 'main')
-    const live = merged.find(g => g.label === 'some-feature')
+    const home = merged.find(g => g.isHome)
 
-    expect(main?.id).toBe('/repo::branch::main')
-    expect(main?.sessions).toHaveLength(1)
-    expect(live?.id).toBe('/repo::branch::some-feature')
-    expect(live?.path).toBe('/repo')
-    expect(live?.sessions).toHaveLength(0)
+    expect(merged.filter(g => g.isMain)).toHaveLength(1)
+    expect(home?.label).toBe('some-feature')
+    expect(home?.path).toBe('/repo')
+    expect(home?.sessions).toHaveLength(1)
+    expect(merged.some(g => g.label === 'main')).toBe(false)
+  })
+
+  it('labels the home lane "main" (still home-flagged) when the root is on trunk', () => {
+    const repo = {
+      id: '/repo',
+      path: '/repo',
+      groups: [lane({ id: '/repo::branch::main', label: 'main', isMain: true, path: '/repo', sessions: [makeSession('/repo')] })]
+    }
+
+    const discovered: HermesGitWorktree[] = [{ branch: 'main', detached: false, isMain: true, locked: false, path: '/repo' }]
+
+    const home = mergeRepoWorktreeGroups(repo, discovered).find(g => g.isHome)
+
+    expect(home?.label).toBe('main')
+    expect(home?.isHome).toBe(true)
+  })
+
+  it('folds multiple historical main-checkout branch lanes into the single live home lane', () => {
+    const repo = {
+      id: '/repo',
+      path: '/repo',
+      groups: [
+        lane({ id: '/repo::branch::main', label: 'main', isMain: true, path: '/repo', sessions: [makeSession('/repo', { id: 'a' })] }),
+        lane({ id: '/repo::branch::old', label: 'old-feature', isMain: true, path: '/repo', sessions: [makeSession('/repo', { id: 'b' })] })
+      ]
+    }
+
+    const discovered: HermesGitWorktree[] = [{ branch: 'bb/live', detached: false, isMain: true, locked: false, path: '/repo' }]
+
+    const merged = mergeRepoWorktreeGroups(repo, discovered)
+    const home = merged.find(g => g.isHome)
+
+    expect(merged.filter(g => g.isMain)).toHaveLength(1)
+    expect(home?.label).toBe('bb/live')
+    expect(home?.sessions.map(s => s.id).sort()).toEqual(['a', 'b'])
+  })
+
+  it('leaves main lanes untouched on a remote backend (no git probe)', () => {
+    const repo = { id: '/repo', path: '/repo', groups: [lane({ id: '/repo::branch::main', label: 'main', isMain: true, path: '/repo', sessions: [makeSession('/repo')] })] }
+
+    // No discovered worktrees → no live branch truth → backend label stands.
+    const merged = mergeRepoWorktreeGroups(repo, undefined)
+
+    expect(merged.map(g => g.label)).toEqual(['main'])
+    expect(merged[0].isHome).toBeFalsy()
   })
 })
 
