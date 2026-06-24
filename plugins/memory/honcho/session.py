@@ -436,6 +436,50 @@ class HonchoSessionManager:
         except (TypeError, ValueError, OSError):
             return None
 
+    def _record_untagged_exclusions(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        session: HonchoSession,
+        reason: str | None = None,
+    ) -> None:
+        """Record state.db ids for successful fail-open untagged writes.
+
+        These ids are intentionally excluded by Slice-2 reconciliation so an
+        already-ingested untagged fallback message is not uploaded again as a
+        tagged duplicate.
+        """
+        try:
+            from plugins.memory.honcho import record_honcho_untagged_exclusion
+        except Exception:
+            logger.debug("Could not import Honcho untagged exclusion recorder", exc_info=True)
+            return
+
+        seen: set[tuple[Any, str]] = set()
+        for msg in messages:
+            fallback_reason = reason or msg.get("_honcho_untagged_fallback_reason")
+            if not fallback_reason:
+                continue
+            metadata = msg.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            message_id = metadata.get("hermes_message_id")
+            if message_id is None:
+                continue
+            key = (message_id, fallback_reason)
+            if key in seen:
+                continue
+            seen.add(key)
+            record_honcho_untagged_exclusion(
+                message_id=message_id,
+                reason=fallback_reason,
+                role=metadata.get("hermes_message_role") or msg.get("role"),
+                session_id=metadata.get("hermes_session_id") or session.honcho_session_id,
+                profile=metadata.get("hermes_profile") or "",
+                ingest_epoch=metadata.get("hermes_ingest_epoch"),
+                message_hash=metadata.get("hermes_message_hash"),
+            )
+
     def _flush_session(self, session: HonchoSession) -> bool:
         """Internal: write unsynced messages to Honcho synchronously."""
         if not session.messages:
@@ -479,8 +523,11 @@ class HonchoSessionManager:
                     exc_info=True,
                 )
                 honcho_messages.append(peer.message(msg["content"]))
+                msg["_honcho_untagged_fallback_reason"] = "tagged_message_construction_failed"
 
-        def _mark_synced() -> None:
+        def _mark_synced(*, record_fallback_exclusions: bool = True) -> None:
+            if record_fallback_exclusions:
+                self._record_untagged_exclusions(new_messages, session=session)
             for msg in new_messages:
                 msg["_synced"] = True
             logger.debug("Synced %d messages to Honcho for %s", len(honcho_messages), session.key)
@@ -505,7 +552,12 @@ class HonchoSessionManager:
                         peer = user_peer if msg["role"] == "user" else assistant_peer
                         untagged_messages.append(peer.message(msg["content"]))
                     honcho_session.add_messages(untagged_messages)
-                    _mark_synced()
+                    self._record_untagged_exclusions(
+                        new_messages,
+                        session=session,
+                        reason="tagged_batch_rejected_untagged_retry",
+                    )
+                    _mark_synced(record_fallback_exclusions=False)
                     logger.warning(
                         "Honcho rejected tagged message batch for %s; retried untagged",
                         session.key,

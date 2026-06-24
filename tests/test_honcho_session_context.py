@@ -1,5 +1,6 @@
 """Tests for Honcho session context peer resolution."""
 
+import json
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -149,16 +150,23 @@ def test_flush_session_batches_messages_and_preserves_metadata_created_at():
     assert all(message["_synced"] for message in session.messages)
 
 
-def test_flush_session_retries_untagged_if_tagged_message_construction_fails():
+def test_flush_session_retries_untagged_if_tagged_message_construction_fails(
+    monkeypatch, tmp_path
+):
     """Metadata rejection must degrade to legacy untagged ingestion."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     mgr, _ = _manager_with_cached_session(ai_observe_others=True)
     session = mgr._cache["test-session"]
-    bad_metadata = {"bad": object()}
+    tagged_metadata = {
+        "hermes_message_id": 101,
+        "hermes_ingest_epoch": 101,
+        "hermes_message_hash": "abc123",
+    }
     session.messages = [
         {
             "role": "user",
             "content": "hello",
-            "metadata": bad_metadata,
+            "metadata": tagged_metadata,
             "created_at": "not-a-date",
         }
     ]
@@ -190,15 +198,23 @@ def test_flush_session_retries_untagged_if_tagged_message_construction_fails():
     assert mgr._flush_session(session) is True
 
     assert peer.calls == [
-        ("hello", {"metadata": bad_metadata, "created_at": "not-a-date"}),
+        ("hello", {"metadata": tagged_metadata, "created_at": "not-a-date"}),
         ("hello", {}),
     ]
     assert recording_honcho_session.calls == [[{"content": "hello"}]]
     assert session.messages[0]["_synced"] is True
+    exclusion_path = tmp_path / "honcho_untagged_ingest_exclusions.jsonl"
+    records = [json.loads(line) for line in exclusion_path.read_text().splitlines()]
+    assert records[0]["hermes_message_id"] == 101
+    assert records[0]["reason"] == "tagged_message_construction_failed"
+    assert records[0]["hermes_ingest_epoch"] == 101
 
 
-def test_flush_session_retries_untagged_if_tagged_batch_is_rejected_before_write():
+def test_flush_session_retries_untagged_if_tagged_batch_is_rejected_before_write(
+    monkeypatch, tmp_path
+):
     """A metadata-shape 4xx from add_messages is pre-write, so retry untagged."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     mgr, _ = _manager_with_cached_session(ai_observe_others=True)
     session = mgr._cache["test-session"]
     created_at = datetime.fromtimestamp(1700000000.25, tz=timezone.utc)
@@ -206,13 +222,13 @@ def test_flush_session_retries_untagged_if_tagged_batch_is_rejected_before_write
         {
             "role": "user",
             "content": "hello",
-            "metadata": {"hermes_message_id": 101},
+            "metadata": {"hermes_message_id": 101, "hermes_ingest_epoch": 101},
             "created_at": created_at,
         },
         {
             "role": "assistant",
             "content": "world",
-            "metadata": {"hermes_message_id": 102},
+            "metadata": {"hermes_message_id": 102, "hermes_ingest_epoch": 101},
             "created_at": created_at,
         },
     ]
@@ -246,6 +262,74 @@ def test_flush_session_retries_untagged_if_tagged_batch_is_rejected_before_write
     assert all("metadata" not in message for message in untagged_batch)
     assert all("created_at" not in message for message in untagged_batch)
     assert all(message["_synced"] for message in session.messages)
+    exclusion_path = tmp_path / "honcho_untagged_ingest_exclusions.jsonl"
+    records = [json.loads(line) for line in exclusion_path.read_text().splitlines()]
+    assert [record["hermes_message_id"] for record in records] == [101, 102]
+    assert {record["reason"] for record in records} == {"tagged_batch_rejected_untagged_retry"}
+    assert all(record["hermes_ingest_epoch"] == 101 for record in records)
+
+
+def test_flush_session_does_not_double_record_when_construction_fallback_batch_rejected(
+    monkeypatch, tmp_path
+):
+    """Batch 4xx fallback should supersede per-message construction fallback markers."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    mgr, _ = _manager_with_cached_session(ai_observe_others=True)
+    session = mgr._cache["test-session"]
+    created_at = datetime.fromtimestamp(1700000000.25, tz=timezone.utc)
+    session.messages = [
+        {
+            "role": "user",
+            "content": "hello",
+            "metadata": {
+                "hermes_message_id": 101,
+                "hermes_ingest_epoch": 101,
+                "hermes_message_hash": "user-hash",
+            },
+            "created_at": created_at,
+        },
+        {
+            "role": "assistant",
+            "content": "world",
+            "metadata": {
+                "hermes_message_id": 102,
+                "hermes_ingest_epoch": 101,
+                "hermes_message_hash": "assistant-hash",
+            },
+            "created_at": created_at,
+        },
+    ]
+
+    class RecordingPeer:
+        def __init__(self, peer_id):
+            self.id = peer_id
+
+        def message(self, content, **kwargs):
+            if self.id == "chris" and kwargs:
+                raise ValueError("user tagged payload rejected locally")
+            return {"peer_id": self.id, "content": content, **kwargs}
+
+    class RejectTaggedBatchOnceHonchoSession:
+        def __init__(self):
+            self.calls = []
+
+        def add_messages(self, messages):
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                raise UnprocessableEntityError("metadata rejected")
+
+    recording_honcho_session = RejectTaggedBatchOnceHonchoSession()
+    mgr._get_or_create_peer = lambda peer_id: RecordingPeer(peer_id)
+    mgr._sessions_cache[session.honcho_session_id] = recording_honcho_session
+
+    assert mgr._flush_session(session) is True
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "honcho_untagged_ingest_exclusions.jsonl").read_text().splitlines()
+    ]
+    assert [record["hermes_message_id"] for record in records] == [101, 102]
+    assert {record["reason"] for record in records} == {"tagged_batch_rejected_untagged_retry"}
 
 
 def test_honcho_sdk_serializes_created_at_as_utc_iso8601():

@@ -34,7 +34,9 @@ logger = logging.getLogger(__name__)
 
 HONCHO_METADATA_VERSION = 1
 HONCHO_METADATA_EPOCH_FILENAME = "honcho_metadata_epoch.json"
+HONCHO_UNTAGGED_EXCLUSIONS_FILENAME = "honcho_untagged_ingest_exclusions.jsonl"
 _HONCHO_METADATA_EPOCH_LOCK = threading.Lock()
+_HONCHO_UNTAGGED_EXCLUSIONS_LOCK = threading.Lock()
 
 
 def honcho_ingest_clean_text(content: Any) -> str:
@@ -66,6 +68,72 @@ def honcho_ingest_message_hash(content: Any) -> str:
 def honcho_ingest_chunk_hash(chunk: str) -> str:
     """Hash one Honcho message chunk for observability/repair metadata."""
     return hashlib.sha256((chunk or "").encode("utf-8")).hexdigest()
+
+
+def honcho_untagged_exclusions_path():
+    """Profile-local JSONL marker for fail-open untagged post-epoch writes."""
+    return get_hermes_home() / HONCHO_UNTAGGED_EXCLUSIONS_FILENAME
+
+
+def record_honcho_untagged_exclusion(
+    *,
+    message_id: Any,
+    reason: str,
+    role: str | None = None,
+    session_id: str = "",
+    profile: str = "",
+    ingest_epoch: Any = None,
+    message_hash: str | None = None,
+) -> bool:
+    """Append one durable exclusion for an untagged above-epoch Honcho write.
+
+    Slice-2 reconciliation cannot metadata-dedup these rows because the live
+    path intentionally sent them without metadata to preserve fail-open
+    ingestion.  Recording their state.db id lets the reconciler treat them like
+    pre-epoch rows instead of uploading a tagged duplicate later.
+    """
+    try:
+        parsed_message_id = int(message_id)
+    except (TypeError, ValueError):
+        return False
+    try:
+        parsed_epoch = int(ingest_epoch) if ingest_epoch is not None else None
+    except (TypeError, ValueError):
+        parsed_epoch = None
+    if parsed_epoch is not None and parsed_message_id < parsed_epoch:
+        return False
+
+    record: dict[str, Any] = {
+        "metadata_version": HONCHO_METADATA_VERSION,
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "source": "live_fail_open_untagged",
+        "reason": reason,
+        "hermes_message_id": parsed_message_id,
+    }
+    if parsed_epoch is not None:
+        record["hermes_ingest_epoch"] = parsed_epoch
+    if role:
+        record["hermes_message_role"] = role
+    if session_id:
+        record["hermes_session_id"] = session_id
+    if profile:
+        record["hermes_profile"] = profile
+    if message_hash:
+        record["hermes_message_hash"] = message_hash
+
+    try:
+        path = honcho_untagged_exclusions_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _HONCHO_UNTAGGED_EXCLUSIONS_LOCK:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, sort_keys=True) + "\n")
+        return True
+    except Exception:
+        # Exclusion recording must never turn fail-open Honcho ingestion into a
+        # failed turn.  Deploy verification should keep this file empty in the
+        # steady-state happy path.
+        logger.debug("Failed to record Honcho untagged-ingest exclusion", exc_info=True)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1304,6 +1372,74 @@ class HonchoMemoryProvider(MemoryProvider):
                 return message
         return candidates[-1] if candidates else None
 
+    @classmethod
+    def _fallback_exclusion_source(
+        cls,
+        messages: Optional[List[Dict[str, Any]]],
+        *,
+        role: str,
+        clean_content: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Best-effort local source-id lookup when tagging itself has failed.
+
+        This is not a reconciler content matcher.  It only records the
+        state.db id for a turn the live path is about to send untagged, so
+        Slice 2 can exclude that id instead of uploading a duplicate.
+        """
+        try:
+            return cls._find_source_message(messages, role=role, clean_content=clean_content)
+        except Exception:
+            pass
+        if not messages:
+            return None
+        candidates: list[Dict[str, Any]] = []
+        for message in messages:
+            try:
+                if not isinstance(message, dict) or message.get("role") != role:
+                    continue
+                if message.get("_session_db_message_id") is None:
+                    continue
+                if role == "assistant" and message.get("tool_calls"):
+                    continue
+                candidates.append(message)
+            except Exception:
+                continue
+        for message in reversed(candidates):
+            try:
+                if honcho_ingest_clean_text(cls._message_content_text(message)) == clean_content:
+                    return message
+            except Exception:
+                continue
+        return candidates[-1] if candidates else None
+
+    def _record_untagged_exclusion_source(
+        self,
+        source_message: Optional[Dict[str, Any]],
+        *,
+        role: str,
+        clean_content: str,
+        session_id: str,
+        reason: str,
+    ) -> None:
+        try:
+            if not source_message:
+                return
+            message_id = source_message.get("_session_db_message_id")
+            if message_id is None:
+                return
+            ingest_epoch = self._ensure_ingest_epoch(message_id, session_id=session_id)
+            record_honcho_untagged_exclusion(
+                message_id=message_id,
+                role=role,
+                session_id=session_id or self._session_key or "",
+                profile=self._active_profile_name(),
+                ingest_epoch=ingest_epoch,
+                message_hash=honcho_ingest_clean_hash(clean_content),
+                reason=reason,
+            )
+        except Exception:
+            logger.debug("Failed to mark Honcho untagged exclusion source", exc_info=True)
+
     def _chunk_metadata(
         self,
         *,
@@ -1424,6 +1560,17 @@ class HonchoMemoryProvider(MemoryProvider):
         msg_limit = self._config.message_max_chars if self._config else 25000
         clean_user_content = honcho_ingest_clean_text(user_content)
         clean_assistant_content = honcho_ingest_clean_text(assistant_content)
+        pending_untagged_exclusions: list[tuple[Optional[Dict[str, Any]], str, str, str]] = []
+
+        def _queue_untagged_exclusion(
+            source_message: Optional[Dict[str, Any]],
+            role: str,
+            clean_content: str,
+            reason: str,
+        ) -> None:
+            if source_message is not None:
+                pending_untagged_exclusions.append((source_message, role, clean_content, reason))
+
         try:
             user_source = self._find_source_message(
                 messages, role="user", clean_content=clean_user_content
@@ -1434,8 +1581,27 @@ class HonchoMemoryProvider(MemoryProvider):
         except Exception:
             # Metadata lookup is opportunistic.  If the mapping layer ever
             # regresses, preserve the historical Honcho contract: send the turn
-            # untagged rather than dropping it.
+            # untagged rather than dropping it.  Also remember the state.db ids
+            # so the reconciler does not upload a tagged duplicate later.
             logger.debug("Honcho metadata source mapping failed; syncing untagged", exc_info=True)
+            user_source = self._fallback_exclusion_source(
+                messages, role="user", clean_content=clean_user_content
+            )
+            assistant_source = self._fallback_exclusion_source(
+                messages, role="assistant", clean_content=clean_assistant_content
+            )
+            _queue_untagged_exclusion(
+                user_source,
+                "user",
+                clean_user_content,
+                "metadata_source_mapping_failed",
+            )
+            _queue_untagged_exclusion(
+                assistant_source,
+                "assistant",
+                clean_assistant_content,
+                "metadata_source_mapping_failed",
+            )
             user_source = None
             assistant_source = None
 
@@ -1454,8 +1620,15 @@ class HonchoMemoryProvider(MemoryProvider):
                     )
                 except Exception:
                     # Tag construction must be fail-open too: an untagged turn is
-                    # strictly better than no Honcho turn.
+                    # strictly better than no Honcho turn.  If that untagged
+                    # flush succeeds, record the source id so Slice 2 excludes it.
                     logger.debug("Honcho metadata construction failed; syncing chunk untagged", exc_info=True)
+                    _queue_untagged_exclusion(
+                        source_message,
+                        role,
+                        clean_content,
+                        "metadata_construction_failed",
+                    )
                     metadata, created_at = None, None
                 kwargs: Dict[str, Any] = {}
                 if metadata:
@@ -1466,10 +1639,28 @@ class HonchoMemoryProvider(MemoryProvider):
 
         def _sync():
             try:
+                if not self._manager:
+                    return
                 session = self._manager.get_or_create(self._session_key)
                 _add_chunks(session, "user", clean_user_content, user_source)
                 _add_chunks(session, "assistant", clean_assistant_content, assistant_source)
-                self._manager._flush_session(session)
+                success = self._manager._flush_session(session)
+                if success is not False and pending_untagged_exclusions:
+                    seen: set[tuple[Any, str]] = set()
+                    for source_message, role, clean_content, reason in pending_untagged_exclusions:
+                        if source_message is None:
+                            continue
+                        key = (source_message.get("_session_db_message_id"), reason)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        self._record_untagged_exclusion_source(
+                            source_message,
+                            role=role,
+                            clean_content=clean_content,
+                            session_id=session_id,
+                            reason=reason,
+                        )
             except Exception as e:
                 logger.debug("Honcho sync_turn failed: %s", e)
 

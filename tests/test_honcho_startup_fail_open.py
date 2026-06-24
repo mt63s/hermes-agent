@@ -353,8 +353,11 @@ def test_honcho_sync_turn_without_messages_keeps_legacy_untagged_ingestion():
     ]
 
 
-def test_honcho_sync_turn_metadata_mapping_failure_still_ingests_untagged(monkeypatch):
-    """A bug in the tag-mapping layer must not drop Honcho ingestion."""
+def test_honcho_sync_turn_metadata_mapping_failure_records_untagged_exclusions(
+    monkeypatch, tmp_path
+):
+    """Untagged above-epoch fallback must be excluded from Slice-2 gap fill."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     provider = HonchoMemoryProvider()
     cfg = _configured_hybrid_config()
     cfg.message_max_chars = 25000
@@ -400,6 +403,68 @@ def test_honcho_sync_turn_metadata_mapping_failure_still_ingests_untagged(monkey
         {"role": "user", "content": "hello"},
         {"role": "assistant", "content": "world"},
     ]
+    exclusion_path = tmp_path / "honcho_untagged_ingest_exclusions.jsonl"
+    records = [json.loads(line) for line in exclusion_path.read_text().splitlines()]
+    assert [record["hermes_message_id"] for record in records] == [101, 102]
+    assert {record["reason"] for record in records} == {"metadata_source_mapping_failed"}
+    assert all(record["hermes_ingest_epoch"] == 101 for record in records)
+
+
+def test_honcho_sync_turn_metadata_construction_failure_records_untagged_exclusions(
+    monkeypatch, tmp_path
+):
+    """If tag construction fails after mapping, Slice 2 must skip the untagged ids."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    provider = HonchoMemoryProvider()
+    cfg = _configured_hybrid_config()
+    cfg.message_max_chars = 25000
+    captured = {}
+
+    class RecordingSession(SimpleNamespace):
+        def __init__(self):
+            super().__init__(messages=[])
+
+        def add_message(self, role, content, **kwargs):
+            self.messages.append({"role": role, "content": content, **kwargs})
+
+    class RecordingManager:
+        def __init__(self):
+            self.session = RecordingSession()
+
+        def get_or_create(self, session_key):
+            return self.session
+
+        def _flush_session(self, session):
+            captured["flushed"] = list(session.messages)
+
+    def broken_metadata(*args, **kwargs):
+        raise RuntimeError("metadata exploded")
+
+    monkeypatch.setattr(HonchoMemoryProvider, "_chunk_metadata", broken_metadata)
+    provider._config = cfg
+    provider._manager = RecordingManager()
+    provider._session_key = "test-session"
+    provider._session_initialized = True
+
+    provider.sync_turn(
+        "hello",
+        "world",
+        messages=[
+            {"role": "user", "content": "hello", "_session_db_message_id": 101},
+            {"role": "assistant", "content": "world", "_session_db_message_id": 102},
+        ],
+    )
+    provider._sync_thread.join(timeout=1)
+
+    assert captured["flushed"] == [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "world"},
+    ]
+    exclusion_path = tmp_path / "honcho_untagged_ingest_exclusions.jsonl"
+    records = [json.loads(line) for line in exclusion_path.read_text().splitlines()]
+    assert [record["hermes_message_id"] for record in records] == [101, 102]
+    assert {record["reason"] for record in records} == {"metadata_construction_failed"}
+    assert all(record["hermes_ingest_epoch"] == 101 for record in records)
 
 
 def test_honcho_system_prompt_advertises_active_while_background_init_runs(monkeypatch):
