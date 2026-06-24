@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sqlite3
 import time
 from collections import defaultdict
@@ -359,6 +360,30 @@ def _resolve_manager() -> HonchoSessionManager:
     return HonchoSessionManager(honcho=client, config=cfg, context_tokens=cfg.context_tokens)
 
 
+def _honcho_session_id(manager: Any, honcho_key: str) -> str:
+    sanitizer = getattr(manager, "_sanitize_id", None)
+    if callable(sanitizer):
+        return str(sanitizer(honcho_key))
+    return re.sub(r"[^a-zA-Z0-9_-]", "-", str(honcho_key))
+
+
+def _resolve_remote_session_read_only(manager: Any, honcho_key: str) -> Any:
+    """Return the remote Honcho session without get_or_create/add_peers.
+
+    Dry-run must not mutate Honcho session peer configuration. The live manager's
+    get_or_create() path intentionally calls add_peers(); reserve it for apply.
+    """
+    honcho_session_id = _honcho_session_id(manager, honcho_key)
+    cache = getattr(manager, "_sessions_cache", {})
+    if isinstance(cache, dict) and honcho_session_id in cache:
+        return cache[honcho_session_id]
+    honcho = getattr(manager, "honcho", None)
+    session_factory = getattr(honcho, "session", None)
+    if callable(session_factory):
+        return session_factory(honcho_session_id)
+    raise RuntimeError("Honcho manager does not expose a read-only session lookup")
+
+
 def _resolve_remote_session(manager: Any, honcho_key: str) -> tuple[Any, Any, Any, Any]:
     local_session = manager.get_or_create(honcho_key)
     user_peer = manager._get_or_create_peer(local_session.user_peer_id)
@@ -494,9 +519,7 @@ def reconcile_honcho(
             "drift_mismatches": 0,
         }
         try:
-            _local_session, remote_session, user_peer, assistant_peer = _resolve_remote_session(
-                manager, honcho_key
-            )
+            remote_session = _resolve_remote_session_read_only(manager, honcho_key)
             present_ids, present_hash_by_id = _present_honcho_ids(
                 _list_existing_honcho_messages(remote_session)
             )
@@ -509,7 +532,7 @@ def reconcile_honcho(
             report.per_session.append(session_summary)
             continue
 
-        payload_groups: list[tuple[StateMessage, list[Any]]] = []
+        gap_messages: list[StateMessage] = []
         for message in messages:
             present = message.id in present_ids
             if present:
@@ -534,32 +557,60 @@ def reconcile_honcho(
 
             report.gaps += 1
             session_summary["gaps"] += 1
+            gap_messages.append(message)
+
+        if options.apply and gap_messages:
             try:
-                payload_groups.append(
-                    (
-                        message,
-                        _build_honcho_messages_for_state_message(
-                            message,
-                            user_peer=user_peer,
-                            assistant_peer=assistant_peer,
-                            epoch=epoch,
-                            profile=profile,
-                            msg_limit=msg_limit,
-                        ),
-                    )
+                _local_session, write_remote_session, user_peer, assistant_peer = _resolve_remote_session(
+                    manager, honcho_key
                 )
             except Exception as exc:
-                report.failed += 1
-                session_summary["failed"] += 1
-                report.failures.append(
-                    ReconcileFailure(state_session_id, honcho_key, message.id, f"message build failed: {exc}")
-                )
+                report.failed += len(gap_messages)
+                session_summary["failed"] += len(gap_messages)
+                for state_message in gap_messages:
+                    report.failures.append(
+                        ReconcileFailure(
+                            state_session_id,
+                            honcho_key,
+                            state_message.id,
+                            f"session/write setup failed: {exc}",
+                        )
+                    )
+                report.per_session.append(session_summary)
+                continue
 
-        if options.apply and payload_groups:
+            payload_groups: list[tuple[StateMessage, list[Any]]] = []
+            for message in gap_messages:
+                try:
+                    payload_groups.append(
+                        (
+                            message,
+                            _build_honcho_messages_for_state_message(
+                                message,
+                                user_peer=user_peer,
+                                assistant_peer=assistant_peer,
+                                epoch=epoch,
+                                profile=profile,
+                                msg_limit=msg_limit,
+                            ),
+                        )
+                    )
+                except Exception as exc:
+                    report.failed += 1
+                    session_summary["failed"] += 1
+                    report.failures.append(
+                        ReconcileFailure(
+                            state_session_id,
+                            honcho_key,
+                            message.id,
+                            f"message build failed: {exc}",
+                        )
+                    )
+
             for batch_groups in _chunk_source_groups(payload_groups, batch_size):
                 batch_messages = [honcho_msg for _state, msgs in batch_groups for honcho_msg in msgs]
                 try:
-                    remote_session.add_messages(batch_messages)
+                    write_remote_session.add_messages(batch_messages)
                 except Exception as exc:
                     failed_count = len(batch_groups)
                     report.failed += failed_count

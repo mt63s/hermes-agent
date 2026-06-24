@@ -59,12 +59,25 @@ class FakeRemoteSession:
         self.existing.extend(batch)
 
 
+class FakeHonchoClient:
+    def __init__(self, manager):
+        self.manager = manager
+
+    def session(self, session_id: str):
+        self.manager.session_lookup_calls += 1
+        self.manager._sessions_cache.setdefault(session_id, FakeRemoteSession())
+        return self.manager._sessions_cache[session_id]
+
+
 class FakeHonchoManager:
     def __init__(self, *, existing_by_key=None, message_max_chars=25000, config=None):
         self._config = config or SimpleNamespace(message_max_chars=message_max_chars)
         self._cache = {}
         self._peers = {}
         self._sessions_cache = {}
+        self.get_or_create_calls = 0
+        self.session_lookup_calls = 0
+        self.honcho = FakeHonchoClient(self)
         for key, messages in (existing_by_key or {}).items():
             self._sessions_cache[self._sanitize(key)] = FakeRemoteSession(messages)
 
@@ -81,6 +94,7 @@ class FakeHonchoManager:
         return self._sessions_cache[honcho_session_id], []
 
     def get_or_create(self, key):
+        self.get_or_create_calls += 1
         if key not in self._cache:
             session = HonchoSession(
                 key=key,
@@ -221,6 +235,7 @@ def test_reconcile_dry_run_dedups_exclusions_and_reports_drift(tmp_path, monkeyp
     assert report.gaps == 1
     assert report.uploaded == 0
     assert [m.hermes_message_id for m in report.drift_mismatches] == [drift]
+    assert manager.get_or_create_calls == 0
     assert manager.remote(session_id).add_batches == []
 
 
