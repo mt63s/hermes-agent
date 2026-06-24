@@ -2418,8 +2418,10 @@ class TelegramAdapter(BasePlatformAdapter):
             if self._should_attempt_rich(content, metadata=metadata):
                 rich_result = await self._try_send_rich(chat_id, content, reply_to, metadata)
                 if rich_result is not None:
-                    if rich_result.success:
-                        # Re-trigger typing like the legacy success path does.
+                    if rich_result.success and self._should_retrigger_typing_after_send(metadata):
+                        # Re-trigger typing for streaming previews/progress only.
+                        # Final sends should let Telegram's chat action expire
+                        # instead of leaving a post-response "typing" bubble.
                         try:
                             await self.send_typing(chat_id, metadata=metadata)
                         except Exception:
@@ -2641,15 +2643,17 @@ class TelegramAdapter(BasePlatformAdapter):
                         raise
                 message_ids.append(str(msg.message_id))
 
-            # Re-trigger typing indicator after sending a message.
-            # Telegram clears the typing state when a new message is delivered,
-            # so without this the "...typing" bubble disappears mid-response
-            # (especially noticeable when the agent sends intermediate progress
-            # messages like "Checking:" before running tools).
-            try:
-                await self.send_typing(chat_id, metadata=metadata)
-            except Exception:
-                pass  # Typing failures are non-fatal
+            if self._should_retrigger_typing_after_send(metadata):
+                # Re-trigger typing indicator after sends that are known to be
+                # intermediate (for example streaming previews that will be
+                # edited). Do not do this for normal/final replies: Telegram
+                # has no explicit "stop typing" action, so a post-final
+                # sendChatAction leaves the client showing "typing" after the
+                # answer has already landed.
+                try:
+                    await self.send_typing(chat_id, metadata=metadata)
+                except Exception:
+                    pass  # Typing failures are non-fatal
 
             return SendResult(
                 success=True,
@@ -2682,6 +2686,24 @@ class TelegramAdapter(BasePlatformAdapter):
             is_connect_timeout = self._looks_like_connect_timeout(e)
             is_pool_timeout = self._looks_like_pool_timeout(e)
             return SendResult(success=False, error=str(e), retryable=(is_connect_timeout or is_pool_timeout or not is_timeout))
+
+    @staticmethod
+    def _should_retrigger_typing_after_send(metadata: Optional[Dict[str, Any]]) -> bool:
+        """Return True only for sends expected to be followed by more work.
+
+        Telegram chat actions cannot be explicitly cancelled; they disappear
+        only after a short TTL or the next message. Re-sending ``typing`` after
+        a final answer therefore creates the confusing UI state where the bot
+        appears to keep typing after it has replied. Streaming preview sends
+        carry ``expect_edits`` because more edits/content are expected, so they
+        retain the historical mid-response typing refresh.
+        """
+        if not metadata:
+            return False
+        return bool(
+            metadata.get("expect_edits")
+            or metadata.get("telegram_retrigger_typing_after_send")
+        )
 
     async def send_or_update_status(
         self,

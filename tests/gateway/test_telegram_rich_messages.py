@@ -260,6 +260,33 @@ async def test_expect_edits_metadata_keeps_preview_on_legacy_path():
     assert bot is not None
     bot.do_api_request.assert_not_called()
     bot.send_message.assert_awaited()
+    bot.send_chat_action.assert_awaited_once_with(
+        chat_id=12345,
+        action="typing",
+        message_thread_id=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_final_rich_send_does_not_retrigger_typing():
+    adapter = _make_adapter()
+
+    result = await adapter.send("12345", RICH_CONTENT)
+
+    assert result.success is True
+    adapter._bot.do_api_request.assert_awaited_once()
+    adapter._bot.send_chat_action.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_final_legacy_send_does_not_retrigger_typing():
+    adapter = _make_adapter()
+
+    result = await adapter.send("12345", "Hello **there**\n\nA normal reply.")
+
+    assert result.success is True
+    adapter._bot.send_message.assert_awaited()
+    adapter._bot.send_chat_action.assert_not_called()
 
 
 @pytest.mark.asyncio
