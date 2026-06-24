@@ -13,6 +13,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
+
 from hermes_state import SessionDB
 from plugins.memory.honcho import honcho_ingest_clean_hash, honcho_ingest_clean_text
 from plugins.memory.honcho.reconcile import (
@@ -155,6 +157,16 @@ def test_select_eligible_state_messages_matches_live_ingestion_contract(tmp_path
         inactive = db.append_message(session_id, "user", "inactive")
         compacted = db.append_message(session_id, "assistant", "compacted")
         blank = db.append_message(session_id, "user", "   ")
+        synthetic_task = db.append_message(
+            session_id,
+            "user",
+            "[Your active task list was preserved across context compression]\n- [ ] internal task",
+        )
+        synthetic_compaction = db.append_message(
+            session_id,
+            "assistant",
+            "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted.",
+        )
         with sqlite3.connect(db_path) as conn:
             conn.execute("UPDATE messages SET active = 0 WHERE id = ?", (inactive,))
             conn.execute("UPDATE messages SET compacted = 1 WHERE id = ?", (compacted,))
@@ -169,6 +181,8 @@ def test_select_eligible_state_messages_matches_live_ingestion_contract(tmp_path
     assert assistant_tool_call not in {row.id for row in rows}
     assert tool_row not in {row.id for row in rows}
     assert blank not in {row.id for row in rows}
+    assert synthetic_task not in {row.id for row in rows}
+    assert synthetic_compaction not in {row.id for row in rows}
     assert rows[0].clean_content == "hello"
     assert rows[1].clean_content == "look\n[screenshot]"
     assert rows[0].message_hash == honcho_ingest_clean_hash("hello")
@@ -247,6 +261,44 @@ def test_reconcile_dry_run_dedups_exclusions_and_reports_drift(tmp_path, monkeyp
     assert manager.remote(session_id).add_batches == []
 
 
+def test_reconcile_skips_sessions_live_path_would_not_sync(tmp_path, monkeypatch):
+    db, db_path = _make_db(tmp_path, monkeypatch)
+    home = db_path.parent
+    try:
+        synced = db.create_session("synced-session", source="telegram")
+        worker = db.create_session("worker-session", source="subagent")
+        synced_msg = db.append_message(synced, "user", "human-facing gap")
+        worker_msg = db.append_message(worker, "user", "worker should stay lean")
+    finally:
+        db.close()
+    _write_epoch(home, synced_msg)
+    manager = FakeHonchoManager(message_max_chars=25000)
+
+    report = reconcile_honcho(
+        ReconcileOptions(hermes_home=home, state_db_path=db_path, apply=False),
+        manager=manager,
+    )
+
+    assert report.scanned == 2
+    assert report.eligible == 1
+    assert report.skipped_non_sync == 1
+    assert report.gaps == 1
+    assert report.per_session[0]["session_id"] == "synced-session"
+    skipped = [s for s in report.per_session if s["session_id"] == "worker-session"][0]
+    assert skipped["skipped_non_sync"] is True
+    assert skipped["source"] == "subagent"
+    assert worker_msg not in {failure.hermes_message_id for failure in report.failures}
+
+    audit = audit_identity_gaps(
+        ReconcileOptions(hermes_home=home, state_db_path=db_path, apply=False),
+        manager=manager,
+    )
+    assert audit.eligible == 1
+    assert audit.skipped_non_sync == 1
+    assert audit.apparent_gaps == 1
+    assert audit.mass_backfill_candidates == 1
+
+
 def test_reconcile_uses_config_session_resolution_from_state_metadata(tmp_path, monkeypatch):
     db, db_path = _make_db(tmp_path, monkeypatch)
     home = db_path.parent
@@ -316,7 +368,12 @@ def test_reconcile_apply_uses_same_resolved_key_as_dry_run(tmp_path, monkeypatch
     assert manager.get_or_create_calls == 0
 
     apply_report = reconcile_honcho(
-        ReconcileOptions(hermes_home=home, state_db_path=db_path, apply=True),
+        ReconcileOptions(
+            hermes_home=home,
+            state_db_path=db_path,
+            apply=True,
+            session_ids=(session_id,),
+        ),
         manager=manager,
     )
 
@@ -331,10 +388,19 @@ def test_identity_audit_partitions_key_drift_from_missing_everywhere(tmp_path, m
     db, db_path = _make_db(tmp_path, monkeypatch)
     home = db_path.parent
     try:
-        session_id = db.create_session("state-session", source="telegram")
-        drifted = db.append_message(session_id, "user", "present elsewhere")
-        missing = db.append_message(session_id, "assistant", "missing everywhere")
-        db.set_session_title(session_id, "New Title")
+        drifted_session = db.create_session("state-session", source="telegram")
+        drifted = db.append_message(drifted_session, "user", "present elsewhere")
+        drifted_missing = db.append_message(drifted_session, "assistant", "missing but session drifted")
+        db.set_session_title(drifted_session, "New Title")
+        clean_session = db.create_session("clean-session", source="telegram")
+        clean_missing = db.append_message(clean_session, "assistant", "clean missing everywhere")
+        db.set_session_title(clean_session, "Clean Title")
+        duplicate_session = db.create_session("duplicate-session", source="telegram")
+        duplicate_missing = db.append_message(duplicate_session, "user", "same content already tagged elsewhere")
+        db.set_session_title(duplicate_session, "Duplicate Title")
+        safe_session = db.create_session("safe-session", source="telegram")
+        safe_missing = db.append_message(safe_session, "assistant", "safe real gap")
+        db.set_session_title(safe_session, "Safe Title")
     finally:
         db.close()
     _write_epoch(home, drifted)
@@ -353,14 +419,29 @@ def test_identity_audit_partitions_key_drift_from_missing_everywhere(tmp_path, m
                     "present elsewhere",
                     metadata={
                         "hermes_message_id": drifted,
-                        "hermes_session_id": session_id,
+                        "hermes_session_id": drifted_session,
                         "hermes_message_hash": honcho_ingest_clean_hash("present elsewhere"),
                         "hermes_ingest_path": "live",
                         "hermes_chunk_index": 0,
                         "hermes_chunk_count": 1,
                     },
                 )
-            ]
+            ],
+            "Clean-Title": [
+                FakeHonchoMessage("hermes-assistant", "clean missing everywhere")
+            ],
+            "Other-Title": [
+                FakeHonchoMessage(
+                    "user-Other-Title",
+                    "same content already tagged elsewhere",
+                    metadata={
+                        "hermes_message_id": 999001,
+                        "hermes_session_id": "other-state-session",
+                        "hermes_message_hash": honcho_ingest_clean_hash("same content already tagged elsewhere"),
+                        "hermes_ingest_path": "live",
+                    },
+                )
+            ],
         },
     )
 
@@ -369,14 +450,56 @@ def test_identity_audit_partitions_key_drift_from_missing_everywhere(tmp_path, m
         manager=manager,
     )
 
-    assert audit.apparent_gaps == 2
+    assert audit.apparent_gaps == 5
     assert audit.elsewhere_present == 1
-    assert audit.missing_everywhere == 1
-    summary = audit.per_session[0]
-    assert summary["honcho_session_key"] == "New-Title"
-    assert summary["missing_ids"] == [missing]
-    assert summary["elsewhere_locations"][0]["hermes_message_id"] == drifted
-    assert summary["elsewhere_locations"][0]["locations"][0]["honcho_session_key"] == old_key
+    assert audit.missing_everywhere == 4
+    assert audit.same_content_present == 2
+    assert audit.untagged_present == 1
+    assert audit.drifted_sessions == 1
+    assert audit.drifted_session_missing_everywhere == 1
+    assert audit.mass_backfill_candidates == 1
+    summaries = {s["session_id"]: s for s in audit.per_session}
+    drift_summary = summaries[drifted_session]
+    clean_summary = summaries[clean_session]
+    duplicate_summary = summaries[duplicate_session]
+    safe_summary = summaries[safe_session]
+    assert drift_summary["honcho_session_key"] == "New-Title"
+    assert drift_summary["session_drifted"] is True
+    assert drift_summary["missing_ids"] == [drifted_missing]
+    assert drift_summary["mass_backfill_candidate_ids"] == []
+    assert drift_summary["elsewhere_locations"][0]["hermes_message_id"] == drifted
+    assert drift_summary["elsewhere_locations"][0]["locations"][0]["honcho_session_key"] == old_key
+    assert clean_summary["session_drifted"] is False
+    assert clean_summary["same_content_present_ids"] == [clean_missing]
+    assert clean_summary["untagged_present_ids"] == [clean_missing]
+    assert clean_summary["mass_backfill_candidate_ids"] == []
+    assert duplicate_summary["session_drifted"] is False
+    assert duplicate_summary["same_content_present_ids"] == [duplicate_missing]
+    assert duplicate_summary["untagged_present_ids"] == []
+    assert duplicate_summary["same_content_locations"][0]["locations"][0]["hermes_message_id"] == 999001
+    assert duplicate_summary["same_content_locations"][0]["locations"][0]["honcho_session_key"] == "Other-Title"
+    assert duplicate_summary["mass_backfill_candidate_ids"] == []
+    assert safe_summary["session_drifted"] is False
+    assert safe_summary["untagged_present_ids"] == []
+    assert safe_summary["mass_backfill_candidate_ids"] == [safe_missing]
+
+
+def test_reconcile_apply_requires_explicit_session_scope(tmp_path, monkeypatch):
+    db, db_path = _make_db(tmp_path, monkeypatch)
+    home = db_path.parent
+    try:
+        session_id = db.create_session("session-unscoped", source="cli")
+        first = db.append_message(session_id, "user", "would be unsafe as mass apply")
+    finally:
+        db.close()
+    _write_epoch(home, first)
+    manager = FakeHonchoManager(message_max_chars=25000)
+
+    with pytest.raises(ValueError, match="Unscoped --apply is disabled"):
+        reconcile_honcho(
+            ReconcileOptions(hermes_home=home, state_db_path=db_path, apply=True),
+            manager=manager,
+        )
 
 
 def test_reconcile_apply_uploads_tagged_batches_and_rerun_is_idempotent(tmp_path, monkeypatch):
@@ -397,6 +520,7 @@ def test_reconcile_apply_uploads_tagged_batches_and_rerun_is_idempotent(tmp_path
             state_db_path=db_path,
             apply=True,
             batch_size=1,
+            session_ids=(session_id,),
         ),
         manager=manager,
     )
@@ -414,7 +538,12 @@ def test_reconcile_apply_uploads_tagged_batches_and_rerun_is_idempotent(tmp_path
     assert uploaded[0].created_at == datetime.fromtimestamp(1700000000.25, tz=timezone.utc)
 
     second_report = reconcile_honcho(
-        ReconcileOptions(hermes_home=home, state_db_path=db_path, apply=True),
+        ReconcileOptions(
+            hermes_home=home,
+            state_db_path=db_path,
+            apply=True,
+            session_ids=(session_id,),
+        ),
         manager=manager,
     )
 
