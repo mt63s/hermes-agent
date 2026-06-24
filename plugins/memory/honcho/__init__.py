@@ -70,6 +70,41 @@ def honcho_ingest_chunk_hash(chunk: str) -> str:
     return hashlib.sha256((chunk or "").encode("utf-8")).hexdigest()
 
 
+def build_honcho_ingest_metadata(
+    *,
+    ingest_path: str,
+    profile: str,
+    session_id: str,
+    message_id: Any,
+    role: str,
+    clean_content: str,
+    chunk: str,
+    chunk_index: int,
+    chunk_count: int,
+    ingest_epoch: Any = None,
+) -> Dict[str, Any]:
+    """Build the shared live/reconcile Honcho message metadata payload.
+
+    Slice 1 and Slice 2 both use this helper so the dedup/hash contract stays
+    byte-for-byte aligned across normal live ingestion and later repair runs.
+    """
+    metadata = {
+        "hermes_metadata_version": HONCHO_METADATA_VERSION,
+        "hermes_ingest_path": ingest_path,
+        "hermes_profile": profile,
+        "hermes_session_id": session_id,
+        "hermes_message_id": message_id,
+        "hermes_message_role": role,
+        "hermes_message_hash": honcho_ingest_clean_hash(clean_content),
+        "hermes_chunk_index": chunk_index,
+        "hermes_chunk_count": chunk_count,
+        "hermes_chunk_hash": honcho_ingest_chunk_hash(chunk),
+    }
+    if ingest_epoch is not None:
+        metadata["hermes_ingest_epoch"] = ingest_epoch
+    return metadata
+
+
 def honcho_untagged_exclusions_path():
     """Profile-local JSONL marker for fail-open untagged post-epoch writes."""
     return get_hermes_home() / HONCHO_UNTAGGED_EXCLUSIONS_FILENAME
@@ -1460,20 +1495,18 @@ class HonchoMemoryProvider(MemoryProvider):
             source_message.get("_session_db_timestamp", source_message.get("timestamp"))
         )
         ingest_epoch = self._ensure_ingest_epoch(message_id, session_id=session_id)
-        metadata = {
-            "hermes_metadata_version": HONCHO_METADATA_VERSION,
-            "hermes_ingest_path": "live",
-            "hermes_profile": self._active_profile_name(),
-            "hermes_session_id": session_id or self._session_key or "",
-            "hermes_message_id": message_id,
-            "hermes_message_role": role,
-            "hermes_message_hash": honcho_ingest_clean_hash(clean_content),
-            "hermes_chunk_index": chunk_index,
-            "hermes_chunk_count": chunk_count,
-            "hermes_chunk_hash": honcho_ingest_chunk_hash(chunk),
-        }
-        if ingest_epoch is not None:
-            metadata["hermes_ingest_epoch"] = ingest_epoch
+        metadata = build_honcho_ingest_metadata(
+            ingest_path="live",
+            profile=self._active_profile_name(),
+            session_id=session_id or self._session_key or "",
+            message_id=message_id,
+            role=role,
+            clean_content=clean_content,
+            chunk=chunk,
+            chunk_index=chunk_index,
+            chunk_count=chunk_count,
+            ingest_epoch=ingest_epoch,
+        )
         return metadata, created_at
 
     def _empty_profile_hint(self, peer: str) -> Dict[str, Any]:
