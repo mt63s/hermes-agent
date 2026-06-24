@@ -8,7 +8,7 @@ import re
 import logging
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
 from plugins.memory.honcho.client import get_honcho_client
@@ -416,6 +416,26 @@ class HonchoSessionManager:
             self._cache[key] = session
         return session
 
+    @staticmethod
+    def _coerce_created_at(value: Any) -> datetime | str | None:
+        """Return a Honcho SDK-compatible created_at value.
+
+        Hermes state.db stores timestamps as epoch seconds; the SDK accepts a
+        datetime or ISO string.  Keep datetime/string inputs intact and convert
+        numeric epoch seconds to UTC datetimes so delayed writes preserve the
+        durable transcript time.
+        """
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            return value
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (TypeError, ValueError, OSError):
+            return None
+
     def _flush_session(self, session: HonchoSession) -> bool:
         """Internal: write unsynced messages to Honcho synchronously."""
         if not session.messages:
@@ -435,19 +455,67 @@ class HonchoSessionManager:
             return True
 
         honcho_messages = []
+        used_tagged_payload = False
         for msg in new_messages:
             peer = user_peer if msg["role"] == "user" else assistant_peer
-            honcho_messages.append(peer.message(msg["content"]))
+            message_kwargs: dict[str, Any] = {}
+            metadata = msg.get("metadata")
+            if isinstance(metadata, dict) and metadata:
+                message_kwargs["metadata"] = metadata
+            created_at = self._coerce_created_at(
+                msg.get("created_at", msg.get("timestamp"))
+            )
+            if created_at is not None:
+                message_kwargs["created_at"] = created_at
+            used_tagged_payload = used_tagged_payload or bool(message_kwargs)
+            try:
+                honcho_messages.append(peer.message(msg["content"], **message_kwargs))
+            except Exception:
+                # Metadata/created_at is best-effort.  If the SDK rejects a
+                # tagged message for any reason, preserve the pre-tagging
+                # behavior by sending the same content untagged.
+                logger.debug(
+                    "Honcho tagged message construction failed; retrying untagged",
+                    exc_info=True,
+                )
+                honcho_messages.append(peer.message(msg["content"]))
 
-        try:
-            honcho_session.add_messages(honcho_messages)
+        def _mark_synced() -> None:
             for msg in new_messages:
                 msg["_synced"] = True
             logger.debug("Synced %d messages to Honcho for %s", len(honcho_messages), session.key)
             with self._cache_lock:
                 self._cache[session.key] = session
+
+        try:
+            honcho_session.add_messages(honcho_messages)
+            _mark_synced()
             return True
         except Exception as e:
+            # A 400/422 response from the message-create endpoint is a pre-write
+            # validation rejection.  If the tagged payload shape is what caused
+            # it, retry the same batch untagged so metadata never makes ingestion
+            # less reliable than it was before Slice 1.  Do NOT retry network,
+            # timeout, rate-limit, or 5xx failures here: those may be ambiguous
+            # after the HTTP request reached the server and could duplicate data.
+            if used_tagged_payload and getattr(e, "status", None) in {400, 422}:
+                try:
+                    untagged_messages = []
+                    for msg in new_messages:
+                        peer = user_peer if msg["role"] == "user" else assistant_peer
+                        untagged_messages.append(peer.message(msg["content"]))
+                    honcho_session.add_messages(untagged_messages)
+                    _mark_synced()
+                    logger.warning(
+                        "Honcho rejected tagged message batch for %s; retried untagged",
+                        session.key,
+                    )
+                    return True
+                except Exception as retry_error:
+                    logger.error(
+                        "Failed to retry Honcho message batch untagged after tagged rejection: %s",
+                        retry_error,
+                    )
             for msg in new_messages:
                 msg["_synced"] = False
             logger.error("Failed to sync messages to Honcho: %s", e)

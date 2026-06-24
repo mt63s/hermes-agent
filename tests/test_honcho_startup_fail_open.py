@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import threading
 import time
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from plugins.memory.honcho import HonchoMemoryProvider
+from plugins.memory.honcho import HonchoMemoryProvider, honcho_ingest_message_hash
 
 
 class _FakeHonchoConfig(SimpleNamespace):
@@ -225,6 +226,180 @@ def test_honcho_sync_turn_waits_for_full_background_startup(monkeypatch):
             provider._prefetch_thread.join(timeout=1)
 
     assert provider._session_initialized is True
+
+
+def test_honcho_sync_turn_tags_live_messages_with_state_db_metadata(monkeypatch, tmp_path):
+    """Post-epoch live Honcho writes must carry the durable state.db replay
+    key and timestamp so a later reconciler can use pure metadata dedup.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    provider = HonchoMemoryProvider()
+    cfg = _configured_hybrid_config()
+    cfg.message_max_chars = 25000
+    captured = {}
+
+    class RecordingSession(SimpleNamespace):
+        def __init__(self):
+            super().__init__(messages=[])
+
+        def add_message(self, role, content, **kwargs):
+            self.messages.append({"role": role, "content": content, **kwargs})
+
+    recording_session = RecordingSession()
+
+    class RecordingManager:
+        def get_or_create(self, session_key):
+            captured["session_key"] = session_key
+            return recording_session
+
+        def _flush_session(self, session):
+            captured["flushed"] = list(session.messages)
+
+    provider._config = cfg
+    provider._manager = RecordingManager()
+    provider._session_key = "test-session"
+    provider._session_initialized = True
+
+    provider.sync_turn(
+        "hello",
+        "world",
+        messages=[
+            {
+                "role": "user",
+                "content": "hello",
+                "_session_db_message_id": 101,
+                "_session_db_timestamp": 1700000000.25,
+            },
+            {
+                "role": "assistant",
+                "content": "world",
+                "_session_db_message_id": 102,
+                "_session_db_timestamp": 1700000001.5,
+            },
+        ],
+    )
+    provider._sync_thread.join(timeout=1)
+
+    assert captured["session_key"] == "test-session"
+    assert len(captured["flushed"]) == 2
+    user_msg, assistant_msg = captured["flushed"]
+    assert user_msg["metadata"]["hermes_message_id"] == 101
+    assert user_msg["metadata"]["hermes_ingest_epoch"] == 101
+    assert user_msg["metadata"]["hermes_message_role"] == "user"
+    assert user_msg["metadata"]["hermes_message_hash"] == honcho_ingest_message_hash("hello")
+    assert user_msg["metadata"]["hermes_chunk_index"] == 0
+    assert user_msg["metadata"]["hermes_chunk_count"] == 1
+    assert user_msg["created_at"] == datetime.fromtimestamp(1700000000.25, tz=timezone.utc)
+    assert assistant_msg["metadata"]["hermes_message_id"] == 102
+    assert assistant_msg["metadata"]["hermes_ingest_epoch"] == 101
+    assert assistant_msg["metadata"]["hermes_message_role"] == "assistant"
+    assert assistant_msg["created_at"] == datetime.fromtimestamp(1700000001.5, tz=timezone.utc)
+    epoch_marker = json.loads((tmp_path / "honcho_metadata_epoch.json").read_text())
+    assert epoch_marker["first_tagged_message_id"] == 101
+    assert epoch_marker["hermes_ingest_epoch"] == 101
+
+
+def test_honcho_ingest_epoch_marker_is_global_write_once(monkeypatch, tmp_path):
+    """The cutover marker is a global messages.id watermark, not per-session state."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    provider = HonchoMemoryProvider()
+    provider._session_key = "first-session"
+
+    assert provider._ensure_ingest_epoch(101, session_id="first-session") == 101
+    provider._session_key = "second-session"
+    assert provider._ensure_ingest_epoch(250, session_id="second-session") == 101
+
+    marker = json.loads((tmp_path / "honcho_metadata_epoch.json").read_text())
+    assert marker["first_tagged_message_id"] == 101
+    assert marker["hermes_ingest_epoch"] == 101
+    assert marker["session_id"] == "first-session"
+
+
+def test_honcho_sync_turn_without_messages_keeps_legacy_untagged_ingestion():
+    """messages=None must preserve the pre-Slice-1 soft-fail behavior."""
+    provider = HonchoMemoryProvider()
+    cfg = _configured_hybrid_config()
+    cfg.message_max_chars = 25000
+    captured = {}
+
+    class RecordingSession(SimpleNamespace):
+        def __init__(self):
+            super().__init__(messages=[])
+
+        def add_message(self, role, content, **kwargs):
+            self.messages.append({"role": role, "content": content, **kwargs})
+
+    class RecordingManager:
+        def __init__(self):
+            self.session = RecordingSession()
+
+        def get_or_create(self, session_key):
+            return self.session
+
+        def _flush_session(self, session):
+            captured["flushed"] = list(session.messages)
+
+    provider._config = cfg
+    provider._manager = RecordingManager()
+    provider._session_key = "test-session"
+    provider._session_initialized = True
+
+    provider.sync_turn("hello", "world")
+    provider._sync_thread.join(timeout=1)
+
+    assert captured["flushed"] == [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "world"},
+    ]
+
+
+def test_honcho_sync_turn_metadata_mapping_failure_still_ingests_untagged(monkeypatch):
+    """A bug in the tag-mapping layer must not drop Honcho ingestion."""
+    provider = HonchoMemoryProvider()
+    cfg = _configured_hybrid_config()
+    cfg.message_max_chars = 25000
+    captured = {}
+
+    class RecordingSession(SimpleNamespace):
+        def __init__(self):
+            super().__init__(messages=[])
+
+        def add_message(self, role, content, **kwargs):
+            self.messages.append({"role": role, "content": content, **kwargs})
+
+    class RecordingManager:
+        def __init__(self):
+            self.session = RecordingSession()
+
+        def get_or_create(self, session_key):
+            return self.session
+
+        def _flush_session(self, session):
+            captured["flushed"] = list(session.messages)
+
+    def broken_mapping(*args, **kwargs):
+        raise RuntimeError("mapping exploded")
+
+    monkeypatch.setattr(HonchoMemoryProvider, "_find_source_message", broken_mapping)
+    provider._config = cfg
+    provider._manager = RecordingManager()
+    provider._session_key = "test-session"
+    provider._session_initialized = True
+
+    provider.sync_turn(
+        "hello",
+        "world",
+        messages=[
+            {"role": "user", "content": "hello", "_session_db_message_id": 101},
+            {"role": "assistant", "content": "world", "_session_db_message_id": 102},
+        ],
+    )
+    provider._sync_thread.join(timeout=1)
+
+    assert captured["flushed"] == [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "world"},
+    ]
 
 
 def test_honcho_system_prompt_advertises_active_while_background_init_runs(monkeypatch):

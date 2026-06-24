@@ -1,7 +1,10 @@
 """Tests for Honcho session context peer resolution."""
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
+from honcho.api_types import MessageCreateParams
+from honcho.http.exceptions import UnprocessableEntityError
 from plugins.memory.honcho.session import HonchoSession, HonchoSessionManager
 
 
@@ -93,3 +96,162 @@ def test_session_context_user_alias_uses_user_self_observer_when_ai_cannot_obser
             "peer_perspective": "chris",
         }
     ]
+
+
+def test_flush_session_batches_messages_and_preserves_metadata_created_at():
+    """The live path flushes all pending chunks through one add_messages call;
+    metadata and created_at must survive from the provider cache to the SDK.
+    """
+    mgr, _ = _manager_with_cached_session(ai_observe_others=True)
+    session = mgr._cache["test-session"]
+    created_at = datetime.fromtimestamp(1700000000.25, tz=timezone.utc)
+    session.messages = [
+        {
+            "role": "user",
+            "content": "hello",
+            "metadata": {"hermes_message_id": 101},
+            "created_at": created_at,
+        },
+        {
+            "role": "assistant",
+            "content": "world",
+            "metadata": {"hermes_message_id": 102},
+            "created_at": created_at,
+        },
+    ]
+
+    class RecordingPeer:
+        def __init__(self, peer_id):
+            self.id = peer_id
+
+        def message(self, content, **kwargs):
+            return {"peer_id": self.id, "content": content, **kwargs}
+
+    class RecordingHonchoSession:
+        def __init__(self):
+            self.calls = []
+
+        def add_messages(self, messages):
+            self.calls.append(messages)
+
+    recording_honcho_session = RecordingHonchoSession()
+    mgr._get_or_create_peer = lambda peer_id: RecordingPeer(peer_id)
+    mgr._sessions_cache[session.honcho_session_id] = recording_honcho_session
+
+    assert mgr._flush_session(session) is True
+
+    assert len(recording_honcho_session.calls) == 1
+    batch = recording_honcho_session.calls[0]
+    assert [message["content"] for message in batch] == ["hello", "world"]
+    assert batch[0]["metadata"] == {"hermes_message_id": 101}
+    assert batch[0]["created_at"] == created_at
+    assert batch[1]["metadata"] == {"hermes_message_id": 102}
+    assert all(message["_synced"] for message in session.messages)
+
+
+def test_flush_session_retries_untagged_if_tagged_message_construction_fails():
+    """Metadata rejection must degrade to legacy untagged ingestion."""
+    mgr, _ = _manager_with_cached_session(ai_observe_others=True)
+    session = mgr._cache["test-session"]
+    bad_metadata = {"bad": object()}
+    session.messages = [
+        {
+            "role": "user",
+            "content": "hello",
+            "metadata": bad_metadata,
+            "created_at": "not-a-date",
+        }
+    ]
+
+    class RecordingPeer:
+        id = "chris"
+
+        def __init__(self):
+            self.calls = []
+
+        def message(self, content, **kwargs):
+            self.calls.append((content, kwargs))
+            if kwargs:
+                raise ValueError("metadata rejected")
+            return {"content": content}
+
+    class RecordingHonchoSession:
+        def __init__(self):
+            self.calls = []
+
+        def add_messages(self, messages):
+            self.calls.append(messages)
+
+    peer = RecordingPeer()
+    recording_honcho_session = RecordingHonchoSession()
+    mgr._get_or_create_peer = lambda peer_id: peer
+    mgr._sessions_cache[session.honcho_session_id] = recording_honcho_session
+
+    assert mgr._flush_session(session) is True
+
+    assert peer.calls == [
+        ("hello", {"metadata": bad_metadata, "created_at": "not-a-date"}),
+        ("hello", {}),
+    ]
+    assert recording_honcho_session.calls == [[{"content": "hello"}]]
+    assert session.messages[0]["_synced"] is True
+
+
+def test_flush_session_retries_untagged_if_tagged_batch_is_rejected_before_write():
+    """A metadata-shape 4xx from add_messages is pre-write, so retry untagged."""
+    mgr, _ = _manager_with_cached_session(ai_observe_others=True)
+    session = mgr._cache["test-session"]
+    created_at = datetime.fromtimestamp(1700000000.25, tz=timezone.utc)
+    session.messages = [
+        {
+            "role": "user",
+            "content": "hello",
+            "metadata": {"hermes_message_id": 101},
+            "created_at": created_at,
+        },
+        {
+            "role": "assistant",
+            "content": "world",
+            "metadata": {"hermes_message_id": 102},
+            "created_at": created_at,
+        },
+    ]
+
+    class RecordingPeer:
+        def __init__(self, peer_id):
+            self.id = peer_id
+
+        def message(self, content, **kwargs):
+            return {"peer_id": self.id, "content": content, **kwargs}
+
+    class RejectOnceHonchoSession:
+        def __init__(self):
+            self.calls = []
+
+        def add_messages(self, messages):
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                raise UnprocessableEntityError("metadata rejected")
+
+    recording_honcho_session = RejectOnceHonchoSession()
+    mgr._get_or_create_peer = lambda peer_id: RecordingPeer(peer_id)
+    mgr._sessions_cache[session.honcho_session_id] = recording_honcho_session
+
+    assert mgr._flush_session(session) is True
+
+    assert len(recording_honcho_session.calls) == 2
+    tagged_batch, untagged_batch = recording_honcho_session.calls
+    assert all("metadata" in message for message in tagged_batch)
+    assert [message["content"] for message in untagged_batch] == ["hello", "world"]
+    assert all("metadata" not in message for message in untagged_batch)
+    assert all("created_at" not in message for message in untagged_batch)
+    assert all(message["_synced"] for message in session.messages)
+
+
+def test_honcho_sdk_serializes_created_at_as_utc_iso8601():
+    created_at = datetime.fromtimestamp(1700000000.25, tz=timezone.utc)
+    msg = MessageCreateParams(peer_id="chris", content="hello", created_at=created_at)
+
+    assert msg.model_dump(mode="json", exclude_none=True)["created_at"] == (
+        "2023-11-14T22:13:20.250000Z"
+    )

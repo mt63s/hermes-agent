@@ -6361,6 +6361,31 @@ class TestPersistUserMessageOverride:
         first_db_write = agent._session_db.append_message.call_args_list[0].kwargs
         assert first_db_write["content"] == "Hello there"
 
+    def test_persist_session_records_state_db_ids_for_memory_sync(self, agent):
+        """External memory sync needs the durable state.db row ids from the
+        just-persisted completed turn so providers can tag their writes with a
+        stable replay key.
+        """
+        agent._session_db = MagicMock()
+        agent._session_db.append_message.side_effect = [101, 102]
+        agent.session_id = "session-123"
+        agent._last_flushed_db_idx = 0
+        agent._persist_user_message_idx = None
+        agent._persist_user_message_override = None
+        messages = [
+            {"role": "user", "content": "Hello", "timestamp": 1700000000.25},
+            {"role": "assistant", "content": "Hi!", "timestamp": 1700000001.5},
+        ]
+
+        agent._persist_session(messages, [])
+
+        assert messages[0]["_session_db_message_id"] == 101
+        assert messages[0]["_session_db_timestamp"] == 1700000000.25
+        assert messages[1]["_session_db_message_id"] == 102
+        assert messages[1]["_session_db_timestamp"] == 1700000001.5
+        assert agent._session_db.append_message.call_args_list[0].kwargs["timestamp"] == 1700000000.25
+        assert agent._session_db.append_message.call_args_list[1].kwargs["timestamp"] == 1700000001.5
+
 
 class TestReasoningReplayForStrictProviders:
     """Assistant replay must preserve provider-native reasoning fields."""

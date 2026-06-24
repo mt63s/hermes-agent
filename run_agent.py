@@ -1652,7 +1652,15 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
-                self._session_db.append_message(
+                message_timestamp = msg.get("timestamp")
+                if message_timestamp is None:
+                    # Capture the timestamp once and pass the same value to
+                    # state.db and the in-memory message metadata.  External
+                    # memory providers can then tag their write with the exact
+                    # durable transcript time instead of inventing a later
+                    # "now" during asynchronous sync.
+                    message_timestamp = time.time()
+                db_message_id = self._session_db.append_message(
                     session_id=self.session_id,
                     role=role,
                     content=content,
@@ -1665,8 +1673,10 @@ class AIAgent:
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
-                    timestamp=msg.get("timestamp"),
+                    timestamp=message_timestamp,
                 )
+                msg["_session_db_message_id"] = db_message_id
+                msg["_session_db_timestamp"] = message_timestamp
                 flushed_ids.add(msg_id)
             self._last_flushed_db_idx = len(messages)
         except Exception as e:

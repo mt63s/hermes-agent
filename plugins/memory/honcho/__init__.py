@@ -15,18 +15,57 @@ Config: Uses the existing Honcho config chain:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import re
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from agent.memory_manager import sanitize_context
 from agent.memory_provider import MemoryProvider
+from hermes_constants import get_hermes_home
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
+
+HONCHO_METADATA_VERSION = 1
+HONCHO_METADATA_EPOCH_FILENAME = "honcho_metadata_epoch.json"
+_HONCHO_METADATA_EPOCH_LOCK = threading.Lock()
+
+
+def honcho_ingest_clean_text(content: Any) -> str:
+    """Sanitize text exactly as Honcho live ingestion does before chunking.
+
+    Slice-2 reconciliation imports this helper instead of reimplementing the
+    sanitize/hash contract, so metadata hashes stay stable across live and
+    replay paths.
+    """
+    if content is None:
+        text = ""
+    elif isinstance(content, str):
+        text = content
+    else:
+        text = str(content)
+    return sanitize_context(text or "").strip()
+
+
+def honcho_ingest_clean_hash(clean_content: str) -> str:
+    """Hash already-sanitized Honcho source-message content."""
+    return hashlib.sha256((clean_content or "").encode("utf-8")).hexdigest()
+
+
+def honcho_ingest_message_hash(content: Any) -> str:
+    """Hash raw content after applying Honcho's ingest sanitizer."""
+    return honcho_ingest_clean_hash(honcho_ingest_clean_text(content))
+
+
+def honcho_ingest_chunk_hash(chunk: str) -> str:
+    """Hash one Honcho message chunk for observability/repair metadata."""
+    return hashlib.sha256((chunk or "").encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -1141,6 +1180,166 @@ class HonchoMemoryProvider(MemoryProvider):
 
         return chunks
 
+    @staticmethod
+    def _active_profile_name() -> str:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            return get_active_profile_name() or "default"
+        except Exception:
+            return "default"
+
+    @staticmethod
+    def _message_content_text(message: Dict[str, Any]) -> str:
+        content = message.get("content")
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, dict):
+                    part_type = part.get("type")
+                    if part_type == "text":
+                        parts.append(str(part.get("text", "")))
+                    elif part_type in {"image", "image_url", "input_image"}:
+                        parts.append("[screenshot]")
+                elif isinstance(part, str):
+                    parts.append(part)
+            return "\n".join(p for p in parts if p)
+        return str(content)
+
+    @staticmethod
+    def _coerce_created_at(value: Any) -> datetime | str | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            return value
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (TypeError, ValueError, OSError):
+            return None
+
+    @staticmethod
+    def _metadata_epoch_path():
+        return get_hermes_home() / HONCHO_METADATA_EPOCH_FILENAME
+
+    def _ensure_ingest_epoch(self, message_id: Any, *, session_id: str = "") -> Optional[int]:
+        """Persist and return the first metadata-tagged state.db message id.
+
+        The reconciler uses this durable cutover boundary to make an honest
+        claim: rows before the marker may lack metadata and are not guaranteed
+        recoverable; rows at/after the marker were produced by the tagging-capable
+        path and can be reconciled by metadata.
+        """
+        try:
+            candidate = int(message_id)
+        except (TypeError, ValueError):
+            return None
+
+        try:
+            path = self._metadata_epoch_path()
+            with _HONCHO_METADATA_EPOCH_LOCK:
+                if path.exists():
+                    try:
+                        existing = json.loads(path.read_text(encoding="utf-8"))
+                        epoch = int(
+                            existing.get("first_tagged_message_id")
+                            or existing.get("hermes_ingest_epoch")
+                        )
+                        if epoch > 0:
+                            return epoch
+                    except Exception:
+                        logger.debug("Ignoring unreadable Honcho metadata epoch marker", exc_info=True)
+
+                marker = {
+                    "metadata_version": HONCHO_METADATA_VERSION,
+                    "first_tagged_message_id": candidate,
+                    "hermes_ingest_epoch": candidate,
+                    "session_id": session_id or self._session_key or "",
+                    "profile": self._active_profile_name(),
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                }
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_name(
+                    f".{path.name}.tmp-{os.getpid()}-{threading.get_ident()}"
+                )
+                tmp.write_text(
+                    json.dumps(marker, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(tmp, path)
+                return candidate
+        except Exception:
+            # Metadata durability must not regress Honcho's best-effort message
+            # ingestion.  Still return the candidate for this message's metadata;
+            # the missing marker will be visible to deploy verification.
+            logger.debug("Failed to persist Honcho metadata epoch marker", exc_info=True)
+            return candidate
+
+    @classmethod
+    def _find_source_message(
+        cls,
+        messages: Optional[List[Dict[str, Any]]],
+        *,
+        role: str,
+        clean_content: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not messages:
+            return None
+        candidates: list[Dict[str, Any]] = []
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") != role:
+                continue
+            if message.get("_session_db_message_id") is None:
+                continue
+            if role == "assistant" and message.get("tool_calls"):
+                continue
+            candidates.append(message)
+        for message in reversed(candidates):
+            if honcho_ingest_clean_text(cls._message_content_text(message)) == clean_content:
+                return message
+        return candidates[-1] if candidates else None
+
+    def _chunk_metadata(
+        self,
+        *,
+        source_message: Optional[Dict[str, Any]],
+        role: str,
+        clean_content: str,
+        chunk: str,
+        chunk_index: int,
+        chunk_count: int,
+        session_id: str,
+    ) -> tuple[Optional[Dict[str, Any]], datetime | str | None]:
+        if not source_message:
+            return None, None
+        message_id = source_message.get("_session_db_message_id")
+        if message_id is None:
+            return None, None
+        created_at = self._coerce_created_at(
+            source_message.get("_session_db_timestamp", source_message.get("timestamp"))
+        )
+        ingest_epoch = self._ensure_ingest_epoch(message_id, session_id=session_id)
+        metadata = {
+            "hermes_metadata_version": HONCHO_METADATA_VERSION,
+            "hermes_ingest_path": "live",
+            "hermes_profile": self._active_profile_name(),
+            "hermes_session_id": session_id or self._session_key or "",
+            "hermes_message_id": message_id,
+            "hermes_message_role": role,
+            "hermes_message_hash": honcho_ingest_clean_hash(clean_content),
+            "hermes_chunk_index": chunk_index,
+            "hermes_chunk_count": chunk_count,
+            "hermes_chunk_hash": honcho_ingest_chunk_hash(chunk),
+        }
+        if ingest_epoch is not None:
+            metadata["hermes_ingest_epoch"] = ingest_epoch
+        return metadata, created_at
+
     def _empty_profile_hint(self, peer: str) -> Dict[str, Any]:
         """Build a diagnostic hint when honcho_profile returns an empty card.
 
@@ -1198,11 +1397,21 @@ class HonchoMemoryProvider(MemoryProvider):
             ),
         }
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
         """Record the conversation turn in Honcho (non-blocking).
 
         Messages exceeding the Honcho API limit (default 25k chars) are
-        split into multiple messages with continuation markers.
+        split into multiple messages with continuation markers.  When the
+        caller provides the current Hermes transcript, completed-turn messages
+        are tagged with their state.db row id so future reconciliation can use
+        metadata-only dedup instead of fragile content/order matching.
         """
         if self._cron_skipped:
             return
@@ -1213,16 +1422,53 @@ class HonchoMemoryProvider(MemoryProvider):
             return
 
         msg_limit = self._config.message_max_chars if self._config else 25000
-        clean_user_content = sanitize_context(user_content or "").strip()
-        clean_assistant_content = sanitize_context(assistant_content or "").strip()
+        clean_user_content = honcho_ingest_clean_text(user_content)
+        clean_assistant_content = honcho_ingest_clean_text(assistant_content)
+        try:
+            user_source = self._find_source_message(
+                messages, role="user", clean_content=clean_user_content
+            )
+            assistant_source = self._find_source_message(
+                messages, role="assistant", clean_content=clean_assistant_content
+            )
+        except Exception:
+            # Metadata lookup is opportunistic.  If the mapping layer ever
+            # regresses, preserve the historical Honcho contract: send the turn
+            # untagged rather than dropping it.
+            logger.debug("Honcho metadata source mapping failed; syncing untagged", exc_info=True)
+            user_source = None
+            assistant_source = None
+
+        def _add_chunks(session, role: str, clean_content: str, source_message) -> None:
+            chunks = self._chunk_message(clean_content, msg_limit)
+            for idx, chunk in enumerate(chunks):
+                try:
+                    metadata, created_at = self._chunk_metadata(
+                        source_message=source_message,
+                        role=role,
+                        clean_content=clean_content,
+                        chunk=chunk,
+                        chunk_index=idx,
+                        chunk_count=len(chunks),
+                        session_id=session_id,
+                    )
+                except Exception:
+                    # Tag construction must be fail-open too: an untagged turn is
+                    # strictly better than no Honcho turn.
+                    logger.debug("Honcho metadata construction failed; syncing chunk untagged", exc_info=True)
+                    metadata, created_at = None, None
+                kwargs: Dict[str, Any] = {}
+                if metadata:
+                    kwargs["metadata"] = metadata
+                if created_at is not None:
+                    kwargs["created_at"] = created_at
+                session.add_message(role, chunk, **kwargs)
 
         def _sync():
             try:
                 session = self._manager.get_or_create(self._session_key)
-                for chunk in self._chunk_message(clean_user_content, msg_limit):
-                    session.add_message("user", chunk)
-                for chunk in self._chunk_message(clean_assistant_content, msg_limit):
-                    session.add_message("assistant", chunk)
+                _add_chunks(session, "user", clean_user_content, user_source)
+                _add_chunks(session, "assistant", clean_assistant_content, assistant_source)
                 self._manager._flush_session(session)
             except Exception as e:
                 logger.debug("Honcho sync_turn failed: %s", e)
