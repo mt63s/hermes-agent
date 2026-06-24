@@ -58,6 +58,40 @@ class StateSessionMetadata:
 
 
 @dataclass(frozen=True)
+class HonchoMessageLocation:
+    """Where a tagged Hermes state.db message id appears in Honcho."""
+
+    honcho_session_key: str
+    hermes_message_id: int
+    hermes_session_id: str | None = None
+    hermes_message_hash: str | None = None
+    hermes_ingest_path: str | None = None
+    hermes_chunk_index: int | None = None
+    hermes_chunk_count: int | None = None
+
+
+@dataclass
+class IdentityAuditReport:
+    """Read-only global id audit for apparent reconciler gaps."""
+
+    epoch: int
+    scanned: int = 0
+    eligible: int = 0
+    honcho_sessions_scanned: int = 0
+    honcho_ids_indexed: int = 0
+    apparent_gaps: int = 0
+    elsewhere_present: int = 0
+    missing_everywhere: int = 0
+    excluded: int = 0
+    failed: int = 0
+    failures: list[ReconcileFailure] = field(default_factory=list)
+    per_session: list[dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class DriftMismatch:
     """A Honcho message exists for an id but with a different content hash."""
 
@@ -350,6 +384,71 @@ def _present_honcho_ids(existing_messages: Iterable[Any]) -> tuple[set[int], dic
     return present, hashes
 
 
+def _session_identifier(session: Any) -> str | None:
+    if isinstance(session, dict):
+        value = session.get("id") or session.get("key") or session.get("name")
+    else:
+        value = getattr(session, "id", None) or getattr(session, "key", None) or getattr(session, "name", None)
+    return str(value) if value else None
+
+
+def _list_honcho_sessions(manager: Any) -> list[Any]:
+    honcho = getattr(manager, "honcho", None)
+    sessions_attr = getattr(honcho, "sessions", None)
+    if callable(sessions_attr):
+        result = sessions_attr()
+        try:
+            return list(cast(Iterable[Any], result))
+        except TypeError:
+            return []
+    cache = getattr(manager, "_sessions_cache", None)
+    if isinstance(cache, dict):
+        return list(cache.values())
+    return []
+
+
+def build_global_honcho_message_index(manager: Any) -> tuple[dict[int, list[HonchoMessageLocation]], int]:
+    """Index tagged Honcho messages by global ``hermes_message_id``.
+
+    This is intentionally read-only. It enumerates Honcho sessions and their
+    message metadata so an apparent per-session gap can be classified as either
+    key drift (id found elsewhere) or a genuine missing Honcho write.
+    """
+    index: dict[int, list[HonchoMessageLocation]] = defaultdict(list)
+    sessions = _list_honcho_sessions(manager)
+    for remote_session in sessions:
+        session_key = _session_identifier(remote_session) or ""
+        for message in _list_existing_honcho_messages(remote_session):
+            metadata = _metadata_from_message(message)
+            message_id = _coerce_int(metadata.get("hermes_message_id"))
+            if message_id is None:
+                continue
+            index[message_id].append(
+                HonchoMessageLocation(
+                    honcho_session_key=session_key,
+                    hermes_message_id=message_id,
+                    hermes_session_id=(
+                        str(metadata.get("hermes_session_id"))
+                        if metadata.get("hermes_session_id") is not None
+                        else None
+                    ),
+                    hermes_message_hash=(
+                        str(metadata.get("hermes_message_hash"))
+                        if metadata.get("hermes_message_hash") is not None
+                        else None
+                    ),
+                    hermes_ingest_path=(
+                        str(metadata.get("hermes_ingest_path"))
+                        if metadata.get("hermes_ingest_path") is not None
+                        else None
+                    ),
+                    hermes_chunk_index=_coerce_int(metadata.get("hermes_chunk_index")),
+                    hermes_chunk_count=_coerce_int(metadata.get("hermes_chunk_count")),
+                )
+            )
+    return index, len(sessions)
+
+
 def _resolve_manager() -> HonchoSessionManager:
     from plugins.memory.honcho.client import HonchoClientConfig, get_honcho_client
 
@@ -447,6 +546,106 @@ def _chunk_source_groups(
         batch_message_count += group_count
     if batch:
         yield batch
+
+
+def audit_identity_gaps(
+    options: ReconcileOptions | None = None,
+    *,
+    manager: Any | None = None,
+) -> IdentityAuditReport:
+    """Classify apparent gaps via global ``hermes_message_id`` lookup.
+
+    A gap in the resolved Honcho session is not automatically a missing write:
+    if that global state.db message id appears in another Honcho session, the
+    problem is session-key drift, not data loss. This audit is read-only and
+    never calls ``get_or_create()`` or ``add_messages()``.
+    """
+    options = options or ReconcileOptions()
+    home = _normalize_home(options.hermes_home)
+    db_path = _normalize_state_db_path(home, options.state_db_path)
+    epoch = load_metadata_epoch(home)
+    exclusion_ids, _malformed = load_exclusion_ids(home)
+    state_messages, scanned = select_eligible_state_messages(
+        db_path,
+        epoch=epoch,
+        session_ids=options.session_ids,
+        limit=options.limit,
+    )
+    if manager is None:
+        manager = _resolve_manager()
+    config = getattr(manager, "_config", None)
+    by_session: dict[str, list[StateMessage]] = defaultdict(list)
+    for message in state_messages:
+        by_session[message.session_id].append(message)
+    session_metadata = load_state_session_metadata(db_path, tuple(by_session.keys()))
+    global_index, session_count = build_global_honcho_message_index(manager)
+
+    report = IdentityAuditReport(
+        epoch=epoch,
+        scanned=scanned,
+        eligible=len(state_messages),
+        honcho_sessions_scanned=session_count,
+        honcho_ids_indexed=len(global_index),
+    )
+
+    for state_session_id, messages in sorted(by_session.items()):
+        honcho_key = options.honcho_session_key or resolve_honcho_session_key(
+            config,
+            state_session_id,
+            session_metadata.get(state_session_id),
+        )
+        session_summary: dict[str, Any] = {
+            "session_id": state_session_id,
+            "honcho_session_key": honcho_key,
+            "eligible": len(messages),
+            "apparent_gaps": 0,
+            "elsewhere_present": 0,
+            "missing_everywhere": 0,
+            "excluded": 0,
+            "elsewhere_locations": [],
+            "missing_ids": [],
+        }
+        try:
+            remote_session = _resolve_remote_session_read_only(manager, honcho_key)
+            present_ids, _present_hash_by_id = _present_honcho_ids(
+                _list_existing_honcho_messages(remote_session)
+            )
+        except Exception as exc:
+            report.failed += len(messages)
+            report.failures.append(
+                ReconcileFailure(state_session_id, honcho_key, None, f"session/list failed: {exc}")
+            )
+            report.per_session.append(session_summary)
+            continue
+
+        for message in messages:
+            if message.id in present_ids:
+                continue
+            if message.id in exclusion_ids:
+                report.excluded += 1
+                session_summary["excluded"] += 1
+                continue
+
+            report.apparent_gaps += 1
+            session_summary["apparent_gaps"] += 1
+            locations = global_index.get(message.id, [])
+            elsewhere = [loc for loc in locations if loc.honcho_session_key != _honcho_session_id(manager, honcho_key)]
+            if elsewhere:
+                report.elsewhere_present += 1
+                session_summary["elsewhere_present"] += 1
+                session_summary["elsewhere_locations"].append(
+                    {
+                        "hermes_message_id": message.id,
+                        "expected_honcho_session_key": honcho_key,
+                        "locations": [asdict(loc) for loc in elsewhere],
+                    }
+                )
+            else:
+                report.missing_everywhere += 1
+                session_summary["missing_everywhere"] += 1
+                session_summary["missing_ids"].append(message.id)
+        report.per_session.append(session_summary)
+    return report
 
 
 def reconcile_honcho(
@@ -647,25 +846,53 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pause", type=float, default=0.0, help="seconds to pause between write batches")
     parser.add_argument("--message-max-chars", type=int, default=None, help="override Honcho message chunk size")
     parser.add_argument("--limit", type=int, default=None, help="limit raw state.db rows scanned")
+    parser.add_argument("--audit-global-ids", action="store_true", help="read-only global hermes_message_id audit for apparent gaps")
     parser.add_argument("--json", action="store_true", help="print machine-readable JSON")
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
-    report = reconcile_honcho(
-        ReconcileOptions(
-            hermes_home=args.hermes_home,
-            state_db_path=args.state_db,
-            apply=args.apply,
-            batch_size=args.batch_size,
-            pause_seconds=args.pause,
-            message_max_chars=args.message_max_chars,
-            session_ids=tuple(args.session_id or ()),
-            honcho_session_key=args.honcho_session_key,
-            limit=args.limit,
-        )
+    options = ReconcileOptions(
+        hermes_home=args.hermes_home,
+        state_db_path=args.state_db,
+        apply=args.apply,
+        batch_size=args.batch_size,
+        pause_seconds=args.pause,
+        message_max_chars=args.message_max_chars,
+        session_ids=tuple(args.session_id or ()),
+        honcho_session_key=args.honcho_session_key,
+        limit=args.limit,
     )
+    if args.audit_global_ids:
+        if args.apply:
+            raise SystemExit("--audit-global-ids is read-only; do not combine with --apply")
+        audit_report = audit_identity_gaps(options)
+        data = audit_report.to_dict()
+        if args.json:
+            print(json.dumps(data, indent=2, sort_keys=True, default=str))
+        else:
+            print(f"Honcho identity audit: epoch={audit_report.epoch}")
+            print(
+                "scanned={scanned} eligible={eligible} honcho_sessions={sessions} "
+                "honcho_ids={ids} apparent_gaps={gaps} elsewhere_present={elsewhere} "
+                "missing_everywhere={missing} excluded={excluded} failed={failed}".format(
+                    scanned=audit_report.scanned,
+                    eligible=audit_report.eligible,
+                    sessions=audit_report.honcho_sessions_scanned,
+                    ids=audit_report.honcho_ids_indexed,
+                    gaps=audit_report.apparent_gaps,
+                    elsewhere=audit_report.elsewhere_present,
+                    missing=audit_report.missing_everywhere,
+                    excluded=audit_report.excluded,
+                    failed=audit_report.failed,
+                )
+            )
+            for failure in audit_report.failures:
+                print(f"failure: {failure.session_id} {failure.hermes_message_id}: {failure.error}")
+        return 0 if audit_report.failed == 0 else 2
+
+    report = reconcile_honcho(options)
     data = report.to_dict()
     if args.json:
         print(json.dumps(data, indent=2, sort_keys=True, default=str))

@@ -17,6 +17,7 @@ from hermes_state import SessionDB
 from plugins.memory.honcho import honcho_ingest_clean_hash, honcho_ingest_clean_text
 from plugins.memory.honcho.reconcile import (
     ReconcileOptions,
+    audit_identity_gaps,
     load_exclusion_ids,
     reconcile_honcho,
     select_eligible_state_messages,
@@ -46,7 +47,8 @@ class FakePeer:
 
 
 class FakeRemoteSession:
-    def __init__(self, existing=None):
+    def __init__(self, existing=None, session_id=""):
+        self.id = session_id
         self.existing = list(existing or [])
         self.add_batches = []
 
@@ -65,8 +67,11 @@ class FakeHonchoClient:
 
     def session(self, session_id: str):
         self.manager.session_lookup_calls += 1
-        self.manager._sessions_cache.setdefault(session_id, FakeRemoteSession())
+        self.manager._sessions_cache.setdefault(session_id, FakeRemoteSession(session_id=session_id))
         return self.manager._sessions_cache[session_id]
+
+    def sessions(self):
+        return list(self.manager._sessions_cache.values())
 
 
 class FakeHonchoManager:
@@ -76,10 +81,12 @@ class FakeHonchoManager:
         self._peers = {}
         self._sessions_cache = {}
         self.get_or_create_calls = 0
+        self.get_or_create_keys = []
         self.session_lookup_calls = 0
         self.honcho = FakeHonchoClient(self)
         for key, messages in (existing_by_key or {}).items():
-            self._sessions_cache[self._sanitize(key)] = FakeRemoteSession(messages)
+            sanitized = self._sanitize(key)
+            self._sessions_cache[sanitized] = FakeRemoteSession(messages, session_id=sanitized)
 
     @staticmethod
     def _sanitize(value: str) -> str:
@@ -90,11 +97,12 @@ class FakeHonchoManager:
         return self._peers[peer_id]
 
     def _get_or_create_honcho_session(self, honcho_session_id, user_peer, assistant_peer):
-        self._sessions_cache.setdefault(honcho_session_id, FakeRemoteSession())
+        self._sessions_cache.setdefault(honcho_session_id, FakeRemoteSession(session_id=honcho_session_id))
         return self._sessions_cache[honcho_session_id], []
 
     def get_or_create(self, key):
         self.get_or_create_calls += 1
+        self.get_or_create_keys.append(key)
         if key not in self._cache:
             session = HonchoSession(
                 key=key,
@@ -280,6 +288,95 @@ def test_reconcile_uses_config_session_resolution_from_state_metadata(tmp_path, 
     assert report.gaps == 0
     assert report.per_session[0]["honcho_session_key"] == "Resolved-Title"
 
+
+
+def test_reconcile_apply_uses_same_resolved_key_as_dry_run(tmp_path, monkeypatch):
+    db, db_path = _make_db(tmp_path, monkeypatch)
+    home = db_path.parent
+    try:
+        session_id = db.create_session("state-session", source="telegram")
+        first = db.append_message(session_id, "user", "resolved gap")
+        db.set_session_title(session_id, "Resolved Title")
+    finally:
+        db.close()
+    _write_epoch(home, first)
+
+    class ResolvingConfig(SimpleNamespace):
+        def resolve_session_name(self, *, cwd=None, session_title=None, session_id=None, gateway_session_key=None):
+            return str(session_title).replace(" ", "-")
+
+    manager = FakeHonchoManager(config=ResolvingConfig(message_max_chars=25000))
+
+    dry_report = reconcile_honcho(
+        ReconcileOptions(hermes_home=home, state_db_path=db_path, apply=False),
+        manager=manager,
+    )
+    assert dry_report.gaps == 1
+    assert dry_report.per_session[0]["honcho_session_key"] == "Resolved-Title"
+    assert manager.get_or_create_calls == 0
+
+    apply_report = reconcile_honcho(
+        ReconcileOptions(hermes_home=home, state_db_path=db_path, apply=True),
+        manager=manager,
+    )
+
+    assert apply_report.uploaded == 1
+    assert apply_report.per_session[0]["honcho_session_key"] == "Resolved-Title"
+    assert manager.get_or_create_keys == ["Resolved-Title"]
+    assert manager.remote("Resolved-Title").add_batches
+    assert "state-session" not in manager._sessions_cache
+
+
+def test_identity_audit_partitions_key_drift_from_missing_everywhere(tmp_path, monkeypatch):
+    db, db_path = _make_db(tmp_path, monkeypatch)
+    home = db_path.parent
+    try:
+        session_id = db.create_session("state-session", source="telegram")
+        drifted = db.append_message(session_id, "user", "present elsewhere")
+        missing = db.append_message(session_id, "assistant", "missing everywhere")
+        db.set_session_title(session_id, "New Title")
+    finally:
+        db.close()
+    _write_epoch(home, drifted)
+
+    class ResolvingConfig(SimpleNamespace):
+        def resolve_session_name(self, *, cwd=None, session_title=None, session_id=None, gateway_session_key=None):
+            return str(session_title).replace(" ", "-")
+
+    old_key = "Old-Title"
+    manager = FakeHonchoManager(
+        config=ResolvingConfig(message_max_chars=25000),
+        existing_by_key={
+            old_key: [
+                FakeHonchoMessage(
+                    "user-Old-Title",
+                    "present elsewhere",
+                    metadata={
+                        "hermes_message_id": drifted,
+                        "hermes_session_id": session_id,
+                        "hermes_message_hash": honcho_ingest_clean_hash("present elsewhere"),
+                        "hermes_ingest_path": "live",
+                        "hermes_chunk_index": 0,
+                        "hermes_chunk_count": 1,
+                    },
+                )
+            ]
+        },
+    )
+
+    audit = audit_identity_gaps(
+        ReconcileOptions(hermes_home=home, state_db_path=db_path, apply=False),
+        manager=manager,
+    )
+
+    assert audit.apparent_gaps == 2
+    assert audit.elsewhere_present == 1
+    assert audit.missing_everywhere == 1
+    summary = audit.per_session[0]
+    assert summary["honcho_session_key"] == "New-Title"
+    assert summary["missing_ids"] == [missing]
+    assert summary["elsewhere_locations"][0]["hermes_message_id"] == drifted
+    assert summary["elsewhere_locations"][0]["locations"][0]["honcho_session_key"] == old_key
 
 
 def test_reconcile_apply_uploads_tagged_batches_and_rerun_is_idempotent(tmp_path, monkeypatch):
